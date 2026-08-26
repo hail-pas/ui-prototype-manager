@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>UI Prototype Manager</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body class="home-body">
+  <main class="home-shell">
+    <header class="home-header">
+      <div><div class="eyebrow">LOCAL PROTOTYPE TOOL</div><h1>UI Prototype Manager</h1><p>上传 HTML / 图片页面，配置点击跳转并直接预览。</p></div>
+      <div class="home-actions"><a class="ghost-btn" href="/logout">退出登录</a><button id="newProjectBtn" class="primary-btn">＋ 新建项目</button></div>
+    </header>
+    <section id="projectGrid" class="project-grid" aria-live="polite"></section>
+  </main>
+
+  <dialog id="newProjectDialog" class="dialog">
+    <form id="newProjectForm" method="dialog">
+      <h2>新建项目</h2>
+      <label>项目名称<input id="projectName" required maxlength="120" placeholder="例如：数据产业大脑原型" /></label>
+      <div class="dialog-actions"><button type="button" class="ghost-btn" id="cancelProjectBtn">取消</button><button class="primary-btn" type="submit">创建</button></div>
+    </form>
+  </dialog>
+  <script src="/static/index.js"></script>
+</body>
+</html>
