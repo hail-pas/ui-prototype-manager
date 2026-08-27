@@ -29,6 +29,10 @@ DB_PATH = DATA_DIR / "app.db"
 ASSET_DIR = DATA_DIR / "assets"
 TOKEN_COOKIE = "uipm_token"
 TOKEN_TTL_SECONDS = 24 * 60 * 60
+DEFAULT_RENDER_MODE = "auto"
+DEFAULT_VIEWPORT_WIDTH = 1920
+DEFAULT_VIEWPORT_HEIGHT = 1080
+RENDER_MODES = {"auto", "responsive", "fixed"}
 
 app = FastAPI(title="UI Prototype Manager", version="0.4.0")
 app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
@@ -129,6 +133,9 @@ def init_db() -> None:
                 type TEXT NOT NULL CHECK(type IN ('html', 'image')),
                 storage_backend TEXT NOT NULL CHECK(storage_backend IN ('local', 's3')),
                 storage_key TEXT NOT NULL,
+                render_mode TEXT NOT NULL DEFAULT 'auto' CHECK(render_mode IN ('auto', 'responsive', 'fixed')),
+                viewport_width INTEGER NOT NULL DEFAULT 1920,
+                viewport_height INTEGER NOT NULL DEFAULT 1080,
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -160,6 +167,13 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_interactions_target ON interactions(target_page_id);
             """
         )
+        page_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(pages)").fetchall()}
+        if "render_mode" not in page_columns:
+            conn.execute("ALTER TABLE pages ADD COLUMN render_mode TEXT NOT NULL DEFAULT 'auto'")
+        if "viewport_width" not in page_columns:
+            conn.execute("ALTER TABLE pages ADD COLUMN viewport_width INTEGER NOT NULL DEFAULT 1920")
+        if "viewport_height" not in page_columns:
+            conn.execute("ALTER TABLE pages ADD COLUMN viewport_height INTEGER NOT NULL DEFAULT 1080")
 
 
 @app.on_event("startup")
@@ -203,6 +217,24 @@ def clean_name(name: str, *, kind: str) -> str:
     if not value:
         raise HTTPException(400, f"{kind} name is required")
     return value
+
+
+def normalize_render_settings(
+    *,
+    render_mode: str | None,
+    viewport_width: int | None,
+    viewport_height: int | None,
+) -> tuple[str, int, int]:
+    mode = str(render_mode or DEFAULT_RENDER_MODE).strip().lower()
+    if mode not in RENDER_MODES:
+        raise HTTPException(400, "render_mode must be auto, responsive or fixed")
+    width = DEFAULT_VIEWPORT_WIDTH if viewport_width is None else int(viewport_width)
+    height = DEFAULT_VIEWPORT_HEIGHT if viewport_height is None else int(viewport_height)
+    if width < 240 or width > 10000:
+        raise HTTPException(400, "viewport_width must be between 240 and 10000")
+    if height < 240 or height > 10000:
+        raise HTTPException(400, "viewport_height must be between 240 and 10000")
+    return mode, width, height
 
 
 def safe_filename(name: str) -> str:
@@ -320,8 +352,11 @@ class ProjectCreate(BaseModel):
     name: str
 
 
-class RenameRequest(BaseModel):
-    name: str
+class PageUpdate(BaseModel):
+    name: str | None = None
+    render_mode: str | None = None
+    viewport_width: int | None = None
+    viewport_height: int | None = None
 
 
 class InteractionCreate(BaseModel):
@@ -331,6 +366,12 @@ class InteractionCreate(BaseModel):
     target_page_id: str | None = None
     kind: str
     payload: dict[str, Any]
+
+
+class InteractionUpdate(BaseModel):
+    name: str | None = None
+    action: str | None = None
+    target_page_id: str | None = None
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -388,6 +429,11 @@ def api_config():
         "storage_backends": ["local", "s3"] if s3_configured() else ["local"],
         "default_storage_backend": "s3" if s3_configured() else "local",
         "data_dir": str(DATA_DIR),
+        "html_render_defaults": {
+            "render_mode": DEFAULT_RENDER_MODE,
+            "viewport_width": DEFAULT_VIEWPORT_WIDTH,
+            "viewport_height": DEFAULT_VIEWPORT_HEIGHT,
+        },
         "s3": {
             "configured": s3_configured(),
             "bucket": cfg["bucket"] if s3_configured() else None,
@@ -456,6 +502,9 @@ async def api_upload_pages(
     project_id: str,
     storage_backend: str | None = Form(None),
     names_json: str | None = Form(None),
+    render_mode: str | None = Form(None),
+    viewport_width: int | None = Form(None),
+    viewport_height: int | None = Form(None),
     files: list[UploadFile] = File(...),
 ):
     get_project(project_id)
@@ -469,6 +518,12 @@ async def api_upload_pages(
         raise HTTPException(400, "storage_backend must be local or s3")
     if backend == "s3" and not s3_configured():
         raise HTTPException(400, "S3 is not configured on the server")
+
+    normalized_render_mode, normalized_viewport_width, normalized_viewport_height = normalize_render_settings(
+        render_mode=render_mode,
+        viewport_width=viewport_width,
+        viewport_height=viewport_height,
+    )
 
     requested_names: list[str] | None = None
     if names_json:
@@ -520,10 +575,17 @@ async def api_upload_pages(
             for offset, item in enumerate(stored):
                 conn.execute(
                     """
-                    INSERT INTO pages(id, project_id, name, type, storage_backend, storage_key, sort_order, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO pages(
+                        id, project_id, name, type, storage_backend, storage_key,
+                        render_mode, viewport_width, viewport_height, sort_order, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (item["id"], project_id, item["name"], item["type"], backend, item["key"], next_order + offset, now_iso()),
+                    (
+                        item["id"], project_id, item["name"], item["type"], backend, item["key"],
+                        normalized_render_mode, normalized_viewport_width, normalized_viewport_height,
+                        next_order + offset, now_iso(),
+                    ),
                 )
     except sqlite3.IntegrityError as exc:
         for item in stored:
@@ -538,14 +600,32 @@ async def api_upload_pages(
 
 
 @app.patch("/api/pages/{page_id}")
-def api_rename_page(page_id: str, payload: RenameRequest):
+def api_update_page(page_id: str, payload: PageUpdate):
     page = get_page(page_id)
-    name = clean_name(payload.name, kind="Page")
+    updates: dict[str, Any] = {}
+    if payload.name is not None:
+        updates["name"] = clean_name(payload.name, kind="Page")
+    if payload.render_mode is not None or payload.viewport_width is not None or payload.viewport_height is not None:
+        render_mode, viewport_width, viewport_height = normalize_render_settings(
+            render_mode=payload.render_mode if payload.render_mode is not None else page.get("render_mode"),
+            viewport_width=payload.viewport_width if payload.viewport_width is not None else page.get("viewport_width"),
+            viewport_height=payload.viewport_height if payload.viewport_height is not None else page.get("viewport_height"),
+        )
+        updates.update(
+            render_mode=render_mode,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+        )
+    if not updates:
+        raise HTTPException(400, "No page fields to update")
+    assignments = ", ".join(f"{field} = ?" for field in updates)
     try:
         with db() as conn:
-            conn.execute("UPDATE pages SET name = ? WHERE id = ?", (name, page_id))
+            conn.execute(f"UPDATE pages SET {assignments} WHERE id = ?", (*updates.values(), page_id))
     except sqlite3.IntegrityError as exc:
-        raise duplicate_error("页面", name) from exc
+        if "name" in updates:
+            raise duplicate_error("页面", str(updates["name"])) from exc
+        raise HTTPException(409, "页面配置冲突") from exc
     return get_page(page_id)
 
 
@@ -588,39 +668,261 @@ html,body{min-height:100%;}
 [data-ui-id]{cursor:pointer!important;}
 """ + ("""
 [data-ui-id]:hover{outline:2px solid #2563eb!important;outline-offset:2px!important;}
-.__uipm_selected{outline:3px solid #2563eb!important;outline-offset:2px!important;}
+#__uipm_overlay_root{position:fixed;inset:0;z-index:2147483646;pointer-events:none;overflow:visible;}
+.__uipm_marker{position:absolute;border:1px solid rgba(37,99,235,.72);border-radius:4px;background:rgba(37,99,235,.08);box-sizing:border-box;pointer-events:none;}
+.__uipm_marker.__uipm_hovered{border-color:#2563eb;background:rgba(37,99,235,.14);}
+.__uipm_marker.__uipm_active{border:3px solid #2563eb;background:rgba(37,99,235,.16);box-shadow:0 0 0 3px rgba(37,99,235,.18);}
+.__uipm_marker.__uipm_draft{border-style:dashed;}
+.__uipm_marker_label{position:absolute;left:-1px;top:-22px;max-width:240px;padding:3px 6px;border-radius:4px;background:#2563eb;color:#fff;font:600 11px/1.35 Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 8px rgba(29,78,216,.24);}
+.__uipm_marker.__uipm_label_below .__uipm_marker_label{top:auto;bottom:-22px;}
 """ if edit_mode else "") + "</style>"
 
-    script = f"""
+    script = r"""
 <script id="__uipm_script">
-(() => {{
-  const PAGE_ID = {json.dumps(page_id)};
-  const EDIT_MODE = {str(edit_mode).lower()};
-  function init() {{
-    const ignored = new Set(['SCRIPT','STYLE','LINK','META','TITLE','BASE','NOSCRIPT']);
-    const elements = Array.from(document.body ? document.body.querySelectorAll('*') : []).filter(el => !ignored.has(el.tagName));
-    elements.forEach((el, i) => el.dataset.uiId = 'u' + (i + 1));
-    document.addEventListener('click', (ev) => {{
-      const raw = ev.target && ev.target.closest ? ev.target.closest('[data-ui-id]') : null;
-      const semantic = ev.target && ev.target.closest ? ev.target.closest('a,button,input,select,textarea,label,[role="button"],[onclick]') : null;
-      const target = semantic && semantic.dataset && semantic.dataset.uiId ? semantic : raw;
+(() => {
+  const PAGE_ID = __PAGE_ID__;
+  const EDIT_MODE = __EDIT_MODE__;
+  const IGNORED_TAGS = new Set(['SCRIPT', 'STYLE', 'LINK', 'META', 'TITLE', 'BASE', 'NOSCRIPT']);
+  const SEMANTIC_SELECTOR = 'a,button,input,select,textarea,label,[role="button"],[onclick]';
+  const editorState = {interactions: [], selectedInteractionId: null, hoveredInteractionId: null, draft: null};
+  let nextElementNumber = 1;
+  let overlayRoot = null;
+  let overlayFrame = 0;
+  let sizeReportFrame = 0;
+  let sizeObserver = null;
+  let mutationObserver = null;
+  let lastOverlayStatus = '';
+  let lastHoveredElementId = null;
+
+  function elementText(element) {
+    return (element.innerText || element.getAttribute('aria-label') || element.getAttribute('title') || '')
+      .trim().replace(/\s+/g, ' ').slice(0, 100);
+  }
+
+  function inspectableElements() {
+    if (!document.body) return [];
+    return Array.from(document.body.querySelectorAll('*')).filter((element) => {
+      if (IGNORED_TAGS.has(element.tagName)) return false;
+      return !element.closest('#__uipm_overlay_root');
+    });
+  }
+
+  function initializeElementIds() {
+    const elements = inspectableElements();
+    elements.forEach((element, index) => { element.dataset.uiId = 'u' + (index + 1); });
+    nextElementNumber = elements.length + 1;
+  }
+
+  function assignIdsToNewElements() {
+    inspectableElements().forEach((element) => {
+      if (!element.dataset.uiId) element.dataset.uiId = 'u' + nextElementNumber++;
+    });
+  }
+
+  function elementById(elementId) {
+    const wanted = String(elementId || '');
+    return inspectableElements().find((element) => element.dataset.uiId === wanted) || null;
+  }
+
+  function interactionTarget(eventTarget, ensureIds = false) {
+    if (!eventTarget || !eventTarget.closest) return null;
+    if (ensureIds) assignIdsToNewElements();
+    const raw = eventTarget.closest('[data-ui-id]');
+    let bound = raw;
+    while (EDIT_MODE && bound) {
+      if (editorState.interactions.some((item) => item.elementId === bound.dataset.uiId)) return bound;
+      bound = bound.parentElement ? bound.parentElement.closest('[data-ui-id]') : null;
+    }
+    const semantic = eventTarget.closest(SEMANTIC_SELECTOR);
+    return semantic && semantic.dataset && semantic.dataset.uiId ? semantic : raw;
+  }
+
+  function reportSize() {
+    cancelAnimationFrame(sizeReportFrame);
+    sizeReportFrame = requestAnimationFrame(() => {
+      const body = document.body;
+      const root = document.documentElement;
+      if (!body || !root) return;
+      let contentWidth = Math.max(body.scrollWidth, root.scrollWidth);
+      let contentHeight = Math.max(body.scrollHeight, root.scrollHeight);
+      Array.from(body.children).forEach((element) => {
+        if (element.id === '__uipm_overlay_root') return;
+        const rect = element.getBoundingClientRect();
+        contentWidth = Math.max(contentWidth, Math.ceil(rect.right + window.scrollX));
+        contentHeight = Math.max(contentHeight, Math.ceil(rect.bottom + window.scrollY));
+      });
+      window.parent.postMessage({
+        type: 'uipm-render-size', pageId: PAGE_ID,
+        viewportWidth: window.innerWidth, viewportHeight: window.innerHeight,
+        contentWidth, contentHeight
+      }, '*');
+    });
+  }
+
+  function postOverlayStatus(missingInteractionIds, elementMeta) {
+    const status = JSON.stringify({missingInteractionIds, elementMeta});
+    if (status === lastOverlayStatus) return;
+    lastOverlayStatus = status;
+    window.parent.postMessage({
+      type: 'uipm-overlay-status', pageId: PAGE_ID,
+      missingInteractionIds, elementMeta
+    }, '*');
+  }
+
+  function renderOverlay() {
+    if (!EDIT_MODE || !overlayRoot) return;
+    overlayRoot.replaceChildren();
+    const missingInteractionIds = [];
+    const elementMeta = [];
+    const elementsById = new Map(inspectableElements().map((element) => [element.dataset.uiId, element]));
+    const items = editorState.interactions.slice();
+    if (editorState.draft && editorState.draft.elementId) {
+      items.push({...editorState.draft, interactionId: '__draft__', draft: true});
+    }
+
+    items.forEach((item) => {
+      const target = elementsById.get(item.elementId) || null;
+      if (!target) {
+        if (!item.draft) missingInteractionIds.push(item.interactionId);
+        return;
+      }
+      const rect = target.getBoundingClientRect();
+      const style = window.getComputedStyle(target);
+      if (rect.width <= 0 || rect.height <= 0 || style.display === 'none' || style.visibility === 'hidden') {
+        if (!item.draft) missingInteractionIds.push(item.interactionId);
+        return;
+      }
+      if (!item.draft) {
+        elementMeta.push({
+          interactionId: item.interactionId,
+          tag: target.tagName.toLowerCase(),
+          text: elementText(target)
+        });
+      }
+      const marker = document.createElement('div');
+      const isActive = item.draft || item.interactionId === editorState.selectedInteractionId;
+      const isHovered = item.interactionId === editorState.hoveredInteractionId;
+      marker.className = '__uipm_marker';
+      if (isActive) marker.classList.add('__uipm_active');
+      if (isHovered) marker.classList.add('__uipm_hovered');
+      if (item.draft) marker.classList.add('__uipm_draft');
+      if (rect.top < 24) marker.classList.add('__uipm_label_below');
+      Object.assign(marker.style, {
+        left: rect.left + 'px', top: rect.top + 'px',
+        width: rect.width + 'px', height: rect.height + 'px'
+      });
+      const label = document.createElement('span');
+      label.className = '__uipm_marker_label';
+      label.textContent = item.name || elementText(target) || item.elementId;
+      marker.appendChild(label);
+      overlayRoot.appendChild(marker);
+    });
+    postOverlayStatus(missingInteractionIds.sort(), elementMeta);
+  }
+
+  function scheduleOverlay() {
+    if (!EDIT_MODE) return;
+    cancelAnimationFrame(overlayFrame);
+    overlayFrame = requestAnimationFrame(renderOverlay);
+  }
+
+  function revealInteraction(interactionId) {
+    const interaction = editorState.interactions.find((item) => item.interactionId === interactionId);
+    const target = interaction ? elementById(interaction.elementId) : null;
+    if (!target) return;
+    target.scrollIntoView({behavior: 'smooth', block: 'center', inline: 'center'});
+    window.setTimeout(scheduleOverlay, 260);
+  }
+
+  function updateEditorState(data) {
+    editorState.interactions = Array.isArray(data.interactions) ? data.interactions.map((item) => ({
+      interactionId: String(item.interactionId || ''),
+      elementId: String(item.elementId || ''),
+      name: String(item.name || '')
+    })).filter((item) => item.interactionId && item.elementId) : [];
+    editorState.selectedInteractionId = data.selectedInteractionId ? String(data.selectedInteractionId) : null;
+    editorState.hoveredInteractionId = data.hoveredInteractionId ? String(data.hoveredInteractionId) : null;
+    editorState.draft = data.draft && data.draft.elementId ? {
+      elementId: String(data.draft.elementId),
+      name: String(data.draft.name || '')
+    } : null;
+    scheduleOverlay();
+    if (data.revealInteractionId) revealInteraction(String(data.revealInteractionId));
+  }
+
+  function postElementHover(elementId) {
+    if (elementId === lastHoveredElementId) return;
+    lastHoveredElementId = elementId;
+    window.parent.postMessage({type: 'uipm-element-hover', pageId: PAGE_ID, elementId}, '*');
+  }
+
+  function init() {
+    initializeElementIds();
+    if (EDIT_MODE) {
+      overlayRoot = document.createElement('div');
+      overlayRoot.id = '__uipm_overlay_root';
+      overlayRoot.setAttribute('aria-hidden', 'true');
+      document.body.appendChild(overlayRoot);
+    }
+
+    document.addEventListener('click', (event) => {
+      const target = interactionTarget(event.target, true);
       if (!target) return;
-      ev.preventDefault(); ev.stopPropagation();
-      if (EDIT_MODE) {{
-        document.querySelectorAll('.__uipm_selected').forEach(el => el.classList.remove('__uipm_selected'));
-        target.classList.add('__uipm_selected');
-      }}
-      window.parent.postMessage({{
+      event.preventDefault();
+      event.stopPropagation();
+      window.parent.postMessage({
         type: 'uipm-element-click', pageId: PAGE_ID, elementId: target.dataset.uiId,
-        tag: target.tagName.toLowerCase(),
-        text: (target.innerText || target.getAttribute('aria-label') || target.getAttribute('title') || '').trim().replace(/\\s+/g,' ').slice(0,100)
-      }}, '*');
-    }}, true);
-  }}
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, {{once:true}}); else init();
-}})();
+        tag: target.tagName.toLowerCase(), text: elementText(target)
+      }, '*');
+    }, true);
+
+    if (EDIT_MODE) {
+      document.addEventListener('pointerover', (event) => {
+        const target = interactionTarget(event.target);
+        postElementHover(target ? target.dataset.uiId : null);
+      }, true);
+      document.addEventListener('pointerout', (event) => {
+        const from = interactionTarget(event.target);
+        const to = interactionTarget(event.relatedTarget);
+        if (from && to && from.dataset.uiId === to.dataset.uiId) return;
+        postElementHover(to ? to.dataset.uiId : null);
+      }, true);
+      window.addEventListener('message', (event) => {
+        const data = event.data;
+        if (event.source !== window.parent || !data || data.type !== 'uipm-editor-state' || String(data.pageId || '') !== PAGE_ID) return;
+        updateEditorState(data);
+      });
+      window.addEventListener('scroll', scheduleOverlay, true);
+      window.addEventListener('resize', scheduleOverlay);
+    }
+
+    reportSize();
+    window.addEventListener('load', () => { reportSize(); scheduleOverlay(); }, {once: true});
+    if (document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(() => { reportSize(); scheduleOverlay(); }).catch(() => {});
+    }
+    if (window.ResizeObserver && document.body) {
+      sizeObserver = new ResizeObserver(() => { reportSize(); scheduleOverlay(); });
+      sizeObserver.observe(document.body);
+    }
+    if (window.MutationObserver && document.body) {
+      mutationObserver = new MutationObserver((records) => {
+        const relevant = records.some((record) => !(record.target.closest && record.target.closest('#__uipm_overlay_root')));
+        if (!relevant) return;
+        assignIdsToNewElements();
+        reportSize();
+        scheduleOverlay();
+      });
+      mutationObserver.observe(document.body, {subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'style', 'hidden']});
+    }
+    if (EDIT_MODE) window.parent.postMessage({type: 'uipm-editor-ready', pageId: PAGE_ID}, '*');
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init, {once: true}); else init();
+})();
 </script>
 """
+    script = script.replace("__PAGE_ID__", json.dumps(page_id)).replace("__EDIT_MODE__", json.dumps(edit_mode))
     injection = css + script
     if re.search(r"</body\s*>", source, flags=re.IGNORECASE):
         return re.sub(r"</body\s*>", lambda _m: injection + "</body>", source, count=1, flags=re.IGNORECASE)
@@ -673,21 +975,29 @@ def normalize_interaction_payload(kind: str, payload: dict[str, Any]) -> dict[st
     raise HTTPException(400, "Invalid interaction kind")
 
 
+def normalize_interaction_action(
+    source: dict[str, Any],
+    action: str,
+    target_page_id: str | None,
+) -> tuple[str, str | None]:
+    normalized_action = str(action or "").strip().lower()
+    if normalized_action not in {"navigate", "back"}:
+        raise HTTPException(400, "action must be navigate or back")
+    if normalized_action == "back":
+        return normalized_action, None
+    if not target_page_id:
+        raise HTTPException(400, "target_page_id is required for navigate action")
+    target = get_page(target_page_id)
+    if source["project_id"] != target["project_id"]:
+        raise HTTPException(400, "Target page must be in the same project")
+    return normalized_action, target["id"]
+
+
 @app.post("/api/interactions")
 def api_create_interaction(payload: InteractionCreate):
     name = clean_name(payload.name, kind="Interaction")
     source = get_page(payload.source_page_id)
-    action = payload.action.strip().lower()
-    if action not in {"navigate", "back"}:
-        raise HTTPException(400, "action must be navigate or back")
-    target_page_id: str | None = None
-    if action == "navigate":
-        if not payload.target_page_id:
-            raise HTTPException(400, "target_page_id is required for navigate action")
-        target = get_page(payload.target_page_id)
-        if source["project_id"] != target["project_id"]:
-            raise HTTPException(400, "Target page must be in the same project")
-        target_page_id = target["id"]
+    action, target_page_id = normalize_interaction_action(source, payload.action, payload.target_page_id)
     project_id = source["project_id"]
     normalized = normalize_interaction_payload(payload.kind, payload.payload)
     interaction_id = str(uuid.uuid4())
@@ -735,14 +1045,31 @@ def api_create_interaction(payload: InteractionCreate):
 
 
 @app.patch("/api/interactions/{interaction_id}")
-def api_rename_interaction(interaction_id: str, payload: RenameRequest):
+def api_update_interaction(interaction_id: str, payload: InteractionUpdate):
     interaction = get_interaction(interaction_id)
-    name = clean_name(payload.name, kind="Interaction")
+    updates: dict[str, Any] = {}
+    if payload.name is not None:
+        updates["name"] = clean_name(payload.name, kind="Interaction")
+
+    fields_set = payload.model_fields_set
+    if payload.action is not None or "target_page_id" in fields_set:
+        source = get_page(interaction["source_page_id"])
+        next_action = payload.action if payload.action is not None else interaction["action"]
+        next_target = payload.target_page_id if "target_page_id" in fields_set else interaction["target_page_id"]
+        action, target_page_id = normalize_interaction_action(source, next_action, next_target)
+        updates.update(action=action, target_page_id=target_page_id)
+
+    if not updates:
+        raise HTTPException(400, "No interaction fields to update")
+
+    assignments = ", ".join(f"{field} = ?" for field in updates)
     try:
         with db() as conn:
-            conn.execute("UPDATE interactions SET name = ? WHERE id = ?", (name, interaction_id))
+            conn.execute(f"UPDATE interactions SET {assignments} WHERE id = ?", (*updates.values(), interaction_id))
     except sqlite3.IntegrityError as exc:
-        raise duplicate_error("交互", name) from exc
+        if "name" in updates:
+            raise duplicate_error("交互", str(updates["name"])) from exc
+        raise HTTPException(409, "交互配置冲突") from exc
     return get_interaction(interaction_id)
 
 

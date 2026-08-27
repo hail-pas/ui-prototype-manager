@@ -10,6 +10,7 @@ const pageNameEl=document.getElementById('playerPageName');
 let state={pages:[],interactions:[]};
 let historyStack=[];
 let currentPageId=null;
+let frameController=null;
 function esc(s=''){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 function page(id){return state.pages.find(p=>p.id===id)}
 function interactions(id){return state.interactions.filter(i=>i.source_page_id===id)}
@@ -52,19 +53,23 @@ function renderPageList(){
   pageList.querySelectorAll('.player-page-item').forEach(btn=>btn.addEventListener('click',()=>navigate(btn.dataset.id)));
 }
 function render(){
+  if(frameController){frameController.destroy();frameController=null;}
   backBtn.disabled=historyStack.length<=1;
   const p=page(currentPageId);pageNameEl.textContent=p?`/ ${p.name}`:'';
   renderPageList();
   if(!p){stage.innerHTML='<div class="player-empty">项目还没有页面。</div>';return;}
   if(p.type==='html'){
-    stage.innerHTML=`<iframe class="player-html" sandbox="allow-scripts" src="/api/pages/${p.id}/render?mode=play"></iframe>`;
+    frameController=window.UIPMFrameFit.create({
+      host:stage,pageId:p.id,title:p.name,src:`/api/pages/${p.id}/render?mode=play`,variant:'player',
+      renderMode:p.render_mode||'auto',viewportWidth:p.viewport_width||1920,viewportHeight:p.viewport_height||1080,
+    });
   }else{
     stage.innerHTML=`<div id="playImageStage" class="player-image-stage"><img src="/api/pages/${p.id}/file" alt="${esc(p.name)}" /></div>`;
     const s=document.getElementById('playImageStage');
     interactions(p.id).filter(i=>i.kind==='region').forEach(i=>{const r=i.payload;const b=document.createElement('button');b.className='player-hotspot';b.type='button';b.title=i.action==='back'?'返回上一页':`跳转到 ${page(i.target_page_id)?.name||''}`;Object.assign(b.style,{left:`${r.x*100}%`,top:`${r.y*100}%`,width:`${r.width*100}%`,height:`${r.height*100}%`});b.addEventListener('click',()=>executeInteraction(i));s.appendChild(b);});
   }
 }
-window.addEventListener('message',e=>{const d=e.data;if(!d||d.type!=='uipm-element-click'||d.pageId!==currentPageId)return;const hit=interactions(currentPageId).find(i=>i.kind==='element'&&i.payload.elementId===d.elementId);executeInteraction(hit);});
+window.addEventListener('message',e=>{const d=e.data;if(!d||d.type!=='uipm-element-click'||d.pageId!==currentPageId)return;if(frameController&&!frameController.ownsMessage(e))return;const hit=interactions(currentPageId).find(i=>i.kind==='element'&&i.payload.elementId===d.elementId);executeInteraction(hit);});
 backBtn.addEventListener('click',goBack);
 navToggle.addEventListener('click',()=>{
   const collapsed=root.classList.toggle('nav-collapsed');

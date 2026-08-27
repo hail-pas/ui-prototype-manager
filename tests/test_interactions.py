@@ -1,0 +1,140 @@
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+
+from fastapi import HTTPException
+
+import app.main as main
+
+
+class InteractionUpdateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.previous_paths = (main.DATA_DIR, main.DB_PATH, main.ASSET_DIR)
+        main.DATA_DIR = Path(self.temp_dir.name)
+        main.DB_PATH = main.DATA_DIR / "app.db"
+        main.ASSET_DIR = main.DATA_DIR / "assets"
+        main.init_db()
+
+        created_at = main.now_iso()
+        with main.db() as connection:
+            connection.executemany(
+                "INSERT INTO projects(id, name, created_at) VALUES (?, ?, ?)",
+                [("project-a", "Project A", created_at), ("project-b", "Project B", created_at)],
+            )
+            connection.executemany(
+                """
+                INSERT INTO pages(id, project_id, name, type, storage_backend, storage_key, created_at)
+                VALUES (?, ?, ?, 'image', 'local', ?, ?)
+                """,
+                [
+                    ("source", "project-a", "Source", "source.png", created_at),
+                    ("target-a", "project-a", "Target A", "target-a.png", created_at),
+                    ("target-b", "project-b", "Target B", "target-b.png", created_at),
+                ],
+            )
+
+    def tearDown(self) -> None:
+        main.DATA_DIR, main.DB_PATH, main.ASSET_DIR = self.previous_paths
+        self.temp_dir.cleanup()
+
+    def create_interaction(self) -> dict:
+        return main.api_create_interaction(
+            main.InteractionCreate(
+                name="Open target",
+                source_page_id="source",
+                action="navigate",
+                target_page_id="target-a",
+                kind="region",
+                payload={"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4},
+            )
+        )
+
+    def test_updates_name_action_and_target_together(self) -> None:
+        interaction = self.create_interaction()
+
+        updated = main.api_update_interaction(
+            interaction["id"],
+            main.InteractionUpdate(name="Go back", action="back", target_page_id=None),
+        )
+
+        self.assertEqual(updated["name"], "Go back")
+        self.assertEqual(updated["action"], "back")
+        self.assertIsNone(updated["target_page_id"])
+        self.assertEqual(updated["payload"], interaction["payload"])
+
+    def test_name_only_patch_preserves_navigation(self) -> None:
+        interaction = self.create_interaction()
+
+        updated = main.api_update_interaction(
+            interaction["id"],
+            main.InteractionUpdate(name="Renamed"),
+        )
+
+        self.assertEqual(updated["name"], "Renamed")
+        self.assertEqual(updated["action"], "navigate")
+        self.assertEqual(updated["target_page_id"], "target-a")
+
+    def test_rejects_target_from_another_project(self) -> None:
+        interaction = self.create_interaction()
+
+        with self.assertRaises(HTTPException) as raised:
+            main.api_update_interaction(
+                interaction["id"],
+                main.InteractionUpdate(action="navigate", target_page_id="target-b"),
+            )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(main.get_interaction(interaction["id"])["target_page_id"], "target-a")
+
+    def test_rejects_empty_patch(self) -> None:
+        interaction = self.create_interaction()
+
+        with self.assertRaises(HTTPException) as raised:
+            main.api_update_interaction(interaction["id"], main.InteractionUpdate())
+
+        self.assertEqual(raised.exception.status_code, 400)
+
+    def test_rejects_duplicate_name_without_changing_existing_value(self) -> None:
+        interaction = self.create_interaction()
+        other = main.api_create_interaction(
+            main.InteractionCreate(
+                name="Other interaction",
+                source_page_id="source",
+                action="back",
+                kind="region",
+                payload={"x": 0.6, "y": 0.2, "width": 0.2, "height": 0.2},
+            )
+        )
+
+        with self.assertRaises(HTTPException) as raised:
+            main.api_update_interaction(
+                interaction["id"],
+                main.InteractionUpdate(name=other["name"]),
+            )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(main.get_interaction(interaction["id"])["name"], "Open target")
+
+
+class InjectedEditorTests(unittest.TestCase):
+    def test_edit_mode_contains_bidirectional_overlay_protocol(self) -> None:
+        rendered = main.injected_html("page-1", "<body><button>Open</button></body>", "edit")
+
+        self.assertIn("uipm-editor-state", rendered)
+        self.assertIn("uipm-overlay-status", rendered)
+        self.assertIn("__uipm_overlay_root", rendered)
+        self.assertIn("uipm-element-hover", rendered)
+
+    def test_play_mode_does_not_render_editor_overlay(self) -> None:
+        rendered = main.injected_html("page-1", "<body><button>Open</button></body>", "play")
+        injected_style = rendered.split('<style id="__uipm_style">', 1)[1].split("</style>", 1)[0]
+
+        self.assertNotIn("#__uipm_overlay_root", injected_style)
+        self.assertIn("uipm-element-click", rendered)
+
+
+if __name__ == "__main__":
+    unittest.main()

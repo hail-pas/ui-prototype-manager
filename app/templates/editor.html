@@ -33,6 +33,10 @@
     </main>
 
     <aside class="sidebar right-sidebar">
+      <section id="renderSettingsSection" class="render-settings-section" hidden>
+        <div class="panel-heading">HTML 显示</div>
+        <div id="renderSettingsPanel" class="render-settings-panel"></div>
+      </section>
       <div class="panel-heading">交互配置</div>
       <div id="selectionPanel" class="selection-panel muted-panel">选择 HTML 元素或框选图片区域后，在这里命名，并设置“跳转页面”或“返回上一页”。</div>
       <div class="panel-heading interactions-heading">当前页交互 <span id="interactionCount" class="count-pill">0</span></div>
@@ -45,6 +49,23 @@
       <h2>确认上传页面</h2>
       <p class="dialog-note">可在创建前修改每个页面名称；同一项目内 HTML 与图片名称必须唯一。</p>
       <div id="uploadRows" class="upload-name-list"></div>
+      <details class="render-config-details">
+        <summary>HTML 显示配置（已有默认值，通常无需修改）</summary>
+        <div class="render-config-body">
+          <label>显示模式
+            <select id="uploadRenderMode">
+              <option value="auto">自动识别固定画布</option>
+              <option value="fixed">固定设计尺寸</option>
+              <option value="responsive">响应式页面</option>
+            </select>
+          </label>
+          <div class="render-config-grid">
+            <label>设计宽度<input id="uploadViewportWidth" type="number" min="240" max="10000" value="1920" /></label>
+            <label>设计高度<input id="uploadViewportHeight" type="number" min="240" max="10000" value="1080" /></label>
+          </div>
+          <p class="dialog-note">自动模式会在页面横向溢出时识别固定画布；宽高作为固定模式和自动识别的安全默认值。</p>
+        </div>
+      </details>
       <div class="dialog-actions"><button type="button" id="uploadCancel" class="ghost-btn">取消</button><button type="submit" class="primary-btn">上传</button></div>
     </form>
   </dialog>
@@ -62,6 +83,7 @@
     </form>
   </dialog>
 
+  <script src="/static/frame-fit.js"></script>
   <script src="/static/editor.js"></script>
 </body>
 </html>
