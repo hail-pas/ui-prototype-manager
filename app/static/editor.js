@@ -287,7 +287,7 @@ async function renderCanvas() {
       <div class="empty-state">
         <div class="empty-icon">↗</div><h2>先上传页面</h2>
         <p>HTML：点击元素配置跳转；图片：拖拽框选区域配置跳转。</p>
-        <label class="primary-btn">上传页面<input class="emptyUpload" type="file" multiple accept=".html,.htm,.png,.jpg,.jpeg,.webp,.gif" hidden></label>
+        <label class="primary-btn">上传页面<input class="emptyUpload" type="file" multiple accept=".html,.htm,.zip,.png,.jpg,.jpeg,.webp,.gif" hidden></label>
       </div>`;
     canvasArea.querySelector('.emptyUpload').addEventListener('change', (event) => prepareUpload(event.target.files));
     return;
@@ -907,7 +907,7 @@ function prepareUpload(files) {
   uploadViewportHeight.value = defaults.viewport_height || 1080;
   uploadRows.innerHTML = pendingFiles.map((file, index) => `
     <div class="upload-name-row">
-      <div><strong>${esc(file.name)}</strong><span>${Math.ceil(file.size / 1024)} KB</span></div>
+      <div><strong>${esc(file.name)}</strong><span>${/\.zip$/i.test(file.name) ? 'ZIP HTML 页面包 · ' : ''}${Math.ceil(file.size / 1024)} KB</span></div>
       <input class="upload-name-input" data-index="${index}" maxlength="120" value="${esc(file.name.replace(/\.[^.]+$/, ''))}">
     </div>`).join('');
   uploadDialog.showModal();

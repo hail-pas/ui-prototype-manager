@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from threading import Lock
 from time import monotonic
-from typing import Protocol
+from typing import BinaryIO, Iterator, Protocol
 
 _PRESIGNED_URL_REFRESH_MARGIN_SECONDS = 60
 _PRESIGNED_URL_CACHE_MAX_ENTRIES = 4096
@@ -191,9 +191,28 @@ def _clear_presigned_url_cache() -> None:
 class ObjectStorage(Protocol):
     def put(self, key: str, data: bytes, *, media_type: str) -> None: ...
 
+    def put_fileobj(
+        self,
+        key: str,
+        fileobj: BinaryIO,
+        *,
+        size: int,
+        media_type: str,
+    ) -> None: ...
+
     def read(self, key: str) -> bytes: ...
 
+    def iter_bytes(
+        self,
+        key: str,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> Iterator[bytes]: ...
+
     def delete(self, key: str) -> None: ...
+
+    def delete_many(self, keys: list[str]) -> None: ...
 
     def presign_get(self, key: str) -> PresignedObject: ...
 
@@ -235,13 +254,67 @@ class S3ObjectStorage:
         )
         _invalidate_presigned_object(self.settings, key)
 
+    def put_fileobj(
+        self,
+        key: str,
+        fileobj: BinaryIO,
+        *,
+        size: int,
+        media_type: str,
+    ) -> None:
+        del size  # boto3 determines the transfer size from the seekable input.
+        self._client().upload_fileobj(
+            fileobj,
+            self.settings.bucket,
+            key,
+            ExtraArgs={
+                "ContentType": media_type,
+                "ContentDisposition": "inline",
+                "CacheControl": f"private, max-age={self.settings.presign_ttl_seconds}",
+            },
+        )
+        _invalidate_presigned_object(self.settings, key)
+
     def read(self, key: str) -> bytes:
         obj = self._client().get_object(Bucket=self.settings.bucket, Key=key)
         return obj["Body"].read()
 
+    def iter_bytes(
+        self,
+        key: str,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> Iterator[bytes]:
+        params = {"Bucket": self.settings.bucket, "Key": key}
+        if start is not None:
+            params["Range"] = f"bytes={start}-{'' if end is None else end}"
+        body = self._client().get_object(**params)["Body"]
+        try:
+            while True:
+                chunk = body.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            body.close()
+
     def delete(self, key: str) -> None:
         self._client().delete_object(Bucket=self.settings.bucket, Key=key)
         _invalidate_presigned_object(self.settings, key)
+
+    def delete_many(self, keys: list[str]) -> None:
+        client = self._client()
+        for offset in range(0, len(keys), 1000):
+            batch = keys[offset : offset + 1000]
+            if not batch:
+                continue
+            client.delete_objects(
+                Bucket=self.settings.bucket,
+                Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
+            )
+            for key in batch:
+                _invalidate_presigned_object(self.settings, key)
 
     def presign_get(self, key: str) -> PresignedObject:
         def sign() -> PresignedObject:
@@ -292,12 +365,62 @@ class OssObjectStorage:
         )
         _invalidate_presigned_object(self.settings, key)
 
+    def put_fileobj(
+        self,
+        key: str,
+        fileobj: BinaryIO,
+        *,
+        size: int,
+        media_type: str,
+    ) -> None:
+        self._bucket().put_object(
+            key,
+            fileobj,
+            headers={
+                "Content-Type": media_type,
+                "Content-Length": str(size),
+                "Content-Disposition": "inline",
+                "Cache-Control": f"private, max-age={self.settings.presign_ttl_seconds}",
+            },
+        )
+        _invalidate_presigned_object(self.settings, key)
+
     def read(self, key: str) -> bytes:
         return self._bucket().get_object(key).read()
+
+    def iter_bytes(
+        self,
+        key: str,
+        *,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> Iterator[bytes]:
+        byte_range = None if start is None else (start, end)
+        body = self._bucket().get_object(key, byte_range=byte_range)
+        try:
+            while True:
+                chunk = body.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            close = getattr(body, "close", None)
+            if close:
+                close()
 
     def delete(self, key: str) -> None:
         self._bucket().delete_object(key)
         _invalidate_presigned_object(self.settings, key)
+
+    def delete_many(self, keys: list[str]) -> None:
+        bucket = self._bucket()
+        for offset in range(0, len(keys), 1000):
+            batch = keys[offset : offset + 1000]
+            if not batch:
+                continue
+            bucket.batch_delete_objects(batch)
+            for key in batch:
+                _invalidate_presigned_object(self.settings, key)
 
     def presign_get(self, key: str) -> PresignedObject:
         def sign() -> PresignedObject:

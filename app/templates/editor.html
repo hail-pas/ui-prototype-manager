@@ -15,7 +15,7 @@
       </div>
       <div class="topbar-actions">
         <label class="storage-picker" title="选择本次上传的资源存储位置"><span>存储</span><select id="storageSelect"><option value="local">本地</option></select></label>
-        <label class="upload-btn">＋ 上传页面<input id="fileInput" type="file" multiple accept=".html,.htm,.png,.jpg,.jpeg,.webp,.gif" hidden /></label>
+        <label class="upload-btn">＋ 上传页面<input id="fileInput" type="file" multiple accept=".html,.htm,.zip,.png,.jpg,.jpeg,.webp,.gif" hidden /></label>
         <a class="primary-btn" href="/project/{{ project.id }}/play" target="_blank">▶ 预览</a>
         <a class="ghost-btn" href="/logout">退出登录</a>
       </div>
@@ -47,7 +47,7 @@
   <dialog id="uploadDialog" class="dialog upload-dialog">
     <form method="dialog" id="uploadForm">
       <h2 id="uploadDialogTitle">确认上传页面</h2>
-      <p class="dialog-note">可在创建前修改每个页面名称；同一项目内 HTML 与图片名称必须唯一。</p>
+      <p class="dialog-note">ZIP 页面包需包含 index.html，可携带使用相对路径的图片、音视频、样式和脚本资源。</p>
       <div id="uploadRows" class="upload-name-list"></div>
       <details class="render-config-details">
         <summary>HTML 显示配置（已有默认值，通常无需修改）</summary>
@@ -91,6 +91,6 @@
   </dialog>
 
   <script src="/static/frame-fit.js"></script>
-  <script src="/static/editor.js?v=20260827-upload-progress-2"></script>
+  <script src="/static/editor.js?v=20260827-zip-pages"></script>
 </body>
 </html>

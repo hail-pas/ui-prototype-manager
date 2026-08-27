@@ -3,24 +3,31 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import json
 import mimetypes
 import os
 import re
 import secrets
+import shutil
 import sqlite3
+import stat
+import tempfile
 import time
 import uuid
+import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
+from typing import Any, BinaryIO
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from app.object_storage import (
     ObjectStorageConfigurationError,
@@ -40,6 +47,16 @@ DEFAULT_VIEWPORT_WIDTH = 1920
 DEFAULT_VIEWPORT_HEIGHT = 1080
 RENDER_MODES = {"auto", "responsive", "fixed"}
 HTML_INSTRUMENTATION_VERSION = 1
+CONTENT_TOKEN_TTL_SECONDS = TOKEN_TTL_SECONDS
+ZIP_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
+ZIP_MAX_EXTRACTED_BYTES = 3 * 1024 * 1024 * 1024
+ZIP_MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
+ZIP_MAX_FILES = 5000
+ZIP_MAX_COMPRESSION_RATIO = 200
+ZIP_MAX_PATH_LENGTH = 512
+HTML_MAX_BYTES = 20 * 1024 * 1024
+IMAGE_MAX_BYTES = 25 * 1024 * 1024
+STREAM_CHUNK_BYTES = 1024 * 1024
 
 app = FastAPI(title="UI Prototype Manager", version="0.5.0")
 app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
@@ -103,7 +120,13 @@ def wants_html(request: Request) -> bool:
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
-    public = path == "/login" or path == "/api/auth/login" or path == "/health" or path.startswith("/static/")
+    public = (
+        path == "/login"
+        or path == "/api/auth/login"
+        or path == "/health"
+        or path.startswith("/static/")
+        or path.startswith("/content/")
+    )
     if public or valid_token(request.cookies.get(TOKEN_COOKIE)):
         return await call_next(request)
     if wants_html(request):
@@ -139,7 +162,8 @@ def init_db() -> None:
                 name TEXT NOT NULL,
                 type TEXT NOT NULL CHECK(type IN ('html', 'image')),
                 storage_backend TEXT NOT NULL CHECK(storage_backend IN ('local', 's3')),
-                storage_key TEXT NOT NULL,
+                storage_prefix TEXT NOT NULL,
+                entry_path TEXT NOT NULL,
                 render_mode TEXT NOT NULL DEFAULT 'auto' CHECK(render_mode IN ('auto', 'responsive', 'fixed')),
                 viewport_width INTEGER NOT NULL DEFAULT 1920,
                 viewport_height INTEGER NOT NULL DEFAULT 1080,
@@ -147,6 +171,15 @@ def init_db() -> None:
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS page_assets (
+                page_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                PRIMARY KEY(page_id, relative_path),
+                FOREIGN KEY(page_id) REFERENCES pages(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS interactions (
@@ -175,15 +208,19 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_interactions_target ON interactions(target_page_id);
             """
         )
-        page_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(pages)").fetchall()}
-        if "render_mode" not in page_columns:
-            conn.execute("ALTER TABLE pages ADD COLUMN render_mode TEXT NOT NULL DEFAULT 'auto'")
-        if "viewport_width" not in page_columns:
-            conn.execute("ALTER TABLE pages ADD COLUMN viewport_width INTEGER NOT NULL DEFAULT 1920")
-        if "viewport_height" not in page_columns:
-            conn.execute("ALTER TABLE pages ADD COLUMN viewport_height INTEGER NOT NULL DEFAULT 1080")
-        if "instrumentation_version" not in page_columns:
-            conn.execute("ALTER TABLE pages ADD COLUMN instrumentation_version INTEGER NOT NULL DEFAULT 0")
+        page_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(pages)").fetchall()
+        }
+        required_columns = {
+            "storage_prefix",
+            "entry_path",
+            "instrumentation_version",
+        }
+        if not required_columns.issubset(page_columns):
+            raise RuntimeError(
+                f"Database schema is incompatible; remove {DB_PATH} and restart"
+            )
 
 
 @app.on_event("startup")
@@ -261,8 +298,8 @@ def s3_configured() -> bool:
     return object_storage_settings().configured
 
 
-def asset_key(project_id: str, page_id: str, ext: str, backend: str) -> str:
-    tail = f"{project_id}/{page_id}{ext}"
+def page_storage_prefix(project_id: str, page_id: str, backend: str) -> str:
+    tail = f"{project_id}/{page_id}"
     if backend == "local":
         return f"assets/{tail}"
     prefix = object_storage_settings().prefix
@@ -271,26 +308,54 @@ def asset_key(project_id: str, page_id: str, ext: str, backend: str) -> str:
 
 def local_asset_path(key: str) -> Path:
     path = (DATA_DIR / key).resolve()
-    if DATA_DIR not in path.parents:
+    if path == DATA_DIR or DATA_DIR not in path.parents:
         raise RuntimeError("Invalid local asset path")
     return path
 
 
-def store_asset(*, backend: str, key: str, data: bytes, media_type: str) -> None:
+def asset_storage_key(page: dict[str, Any], relative_path: str) -> str:
+    return f'{str(page["storage_prefix"]).rstrip("/")}/{relative_path}'
+
+
+def store_asset_stream(
+    *,
+    backend: str,
+    key: str,
+    fileobj: BinaryIO,
+    size: int,
+    media_type: str,
+) -> None:
+    fileobj.seek(0)
     if backend == "local":
         path = local_asset_path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
+        with path.open("wb") as output:
+            shutil.copyfileobj(fileobj, output, length=STREAM_CHUNK_BYTES)
         return
     if backend == "s3":
-        object_storage().put(key, data, media_type=media_type)
+        object_storage().put_fileobj(
+            key,
+            fileobj,
+            size=size,
+            media_type=media_type,
+        )
         return
     raise RuntimeError(f"Unsupported storage backend: {backend}")
 
 
-def read_asset(page: dict[str, Any]) -> bytes:
+def store_asset_bytes(*, backend: str, key: str, data: bytes, media_type: str) -> None:
+    store_asset_stream(
+        backend=backend,
+        key=key,
+        fileobj=io.BytesIO(data),
+        size=len(data),
+        media_type=media_type,
+    )
+
+
+def read_page_asset(page: dict[str, Any], relative_path: str | None = None) -> bytes:
     backend = page["storage_backend"]
-    key = page["storage_key"]
+    key = asset_storage_key(page, relative_path or page["entry_path"])
     if backend == "local":
         path = local_asset_path(key)
         if not path.exists():
@@ -301,44 +366,70 @@ def read_asset(page: dict[str, Any]) -> bytes:
     raise FileNotFoundError(f"Unknown storage backend: {backend}")
 
 
-def delete_asset(page: dict[str, Any]) -> None:
+def page_asset_paths(page_id: str) -> list[str]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT relative_path FROM page_assets WHERE page_id = ? ORDER BY relative_path",
+            (page_id,),
+        ).fetchall()
+    return [str(row["relative_path"]) for row in rows]
+
+
+def delete_asset_package(
+    page: dict[str, Any], relative_paths: list[str] | None = None
+) -> None:
     backend = page.get("storage_backend")
-    key = page.get("storage_key")
-    if not key:
+    prefix = page.get("storage_prefix")
+    if not prefix:
         return
     if backend == "local":
         try:
-            local_asset_path(key).unlink(missing_ok=True)
+            shutil.rmtree(local_asset_path(str(prefix)), ignore_errors=True)
         except OSError:
             pass
         return
     if backend == "s3" and s3_configured():
         try:
-            object_storage().delete(key)
+            paths = relative_paths
+            if paths is None and page.get("id"):
+                paths = page_asset_paths(str(page["id"]))
+            keys = [f'{str(prefix).rstrip("/")}/{path}' for path in paths or []]
+            object_storage().delete_many(keys)
         except Exception:
             pass
 
 
-def proxy_content_url(page: dict[str, Any]) -> str:
-    suffix = "render" if page["type"] == "html" else "file"
-    return f'/api/pages/{page["id"]}/{suffix}'
+def create_content_token(page_id: str) -> tuple[str, int]:
+    expires_at = int(time.time()) + CONTENT_TOKEN_TTL_SECONDS
+    message = f"uipm-content-v1:{page_id}:{expires_at}".encode("utf-8")
+    signature = hmac.new(token_secret(), message, hashlib.sha256).digest()
+    return f"{expires_at}.{_b64encode(signature)}", expires_at
+
+
+def valid_content_token(page_id: str, token: str) -> bool:
+    if "." not in token:
+        return False
+    try:
+        expires_raw, signature_raw = token.split(".", 1)
+        expires_at = int(expires_raw)
+        now = int(time.time())
+        if now >= expires_at or expires_at > now + CONTENT_TOKEN_TTL_SECONDS + 60:
+            return False
+        message = f"uipm-content-v1:{page_id}:{expires_at}".encode("utf-8")
+        expected = hmac.new(token_secret(), message, hashlib.sha256).digest()
+        return hmac.compare_digest(expected, _b64decode(signature_raw))
+    except Exception:
+        return False
 
 
 def page_to_api(page: dict[str, Any]) -> dict[str, Any]:
     item = dict(page)
-    settings = object_storage_settings()
-    if item["storage_backend"] != "s3" or not settings.direct_read:
-        item["content_url"] = proxy_content_url(item)
-        item["content_url_expires_at"] = None
-        return item
-    try:
-        signed = object_storage().presign_get(item["storage_key"])
-    except ObjectStorageConfigurationError as exc:
-        raise HTTPException(503, str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(502, "Failed to create an object storage access URL") from exc
-    item["content_url"] = signed.url
-    item["content_url_expires_at"] = signed.expires_at
+    token, expires_at = create_content_token(str(item["id"]))
+    entry_path = quote(str(item["entry_path"]), safe="/")
+    item["content_url"] = f'/content/{item["id"]}/{token}/{entry_path}'
+    item["content_url_expires_at"] = datetime.fromtimestamp(
+        expires_at, tz=timezone.utc
+    ).isoformat()
     return item
 
 
@@ -370,6 +461,301 @@ class InteractionUpdate(BaseModel):
     name: str | None = None
     action: str | None = None
     target_page_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ArchiveMember:
+    info: zipfile.ZipInfo
+    relative_path: str
+    media_type: str
+
+
+def file_size(fileobj: BinaryIO) -> int:
+    position = fileobj.tell()
+    fileobj.seek(0, os.SEEK_END)
+    size = fileobj.tell()
+    fileobj.seek(position)
+    return size
+
+
+def media_type_for_path(relative_path: str) -> str:
+    suffix = PurePosixPath(relative_path).suffix.lower()
+    overrides = {
+        ".css": "text/css; charset=utf-8",
+        ".html": "text/html; charset=utf-8",
+        ".htm": "text/html; charset=utf-8",
+        ".js": "text/javascript; charset=utf-8",
+        ".mjs": "text/javascript; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".map": "application/json; charset=utf-8",
+        ".svg": "image/svg+xml",
+        ".woff": "font/woff",
+        ".woff2": "font/woff2",
+        ".m3u8": "application/vnd.apple.mpegurl",
+    }
+    return overrides.get(
+        suffix,
+        mimetypes.guess_type(relative_path)[0] or "application/octet-stream",
+    )
+
+
+def validate_relative_asset_path(raw_path: str) -> str:
+    if not raw_path or "\x00" in raw_path or "\\" in raw_path:
+        raise HTTPException(400, f"ZIP contains an invalid path: {raw_path!r}")
+    if len(raw_path) > ZIP_MAX_PATH_LENGTH or re.match(r"^[A-Za-z]:", raw_path):
+        raise HTTPException(400, f"ZIP path is not allowed: {raw_path}")
+    if raw_path.startswith("/") or "//" in raw_path:
+        raise HTTPException(400, f"ZIP path is not relative: {raw_path}")
+    path = PurePosixPath(raw_path)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise HTTPException(400, f"ZIP path is not safe: {raw_path}")
+    if any(len(part) > 255 for part in path.parts):
+        raise HTTPException(400, f"ZIP path segment is too long: {raw_path}")
+    return path.as_posix()
+
+
+def is_ignored_archive_path(relative_path: str) -> bool:
+    parts = PurePosixPath(relative_path).parts
+    return bool(parts) and (parts[0] == "__MACOSX" or parts[-1] == ".DS_Store")
+
+
+def inspect_zip(upload: UploadFile, filename: str) -> tuple[zipfile.ZipFile, list[ArchiveMember]]:
+    upload.file.seek(0)
+    upload_bytes = file_size(upload.file)
+    upload.file.seek(0)
+    if upload_bytes == 0:
+        raise HTTPException(400, f"{filename} is empty")
+    if upload_bytes > ZIP_MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"{filename} exceeds the ZIP upload limit")
+    try:
+        archive = zipfile.ZipFile(upload.file)
+    except (zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        raise HTTPException(400, f"{filename} is not a valid ZIP archive") from exc
+
+    raw_members: list[tuple[zipfile.ZipInfo, str]] = []
+    try:
+        for info in archive.infolist():
+            path = validate_relative_asset_path(info.filename.rstrip("/"))
+            unix_mode = (info.external_attr >> 16) & 0xFFFF
+            if stat.S_ISLNK(unix_mode):
+                raise HTTPException(400, f"ZIP symbolic links are not allowed: {path}")
+            if info.flag_bits & 0x1:
+                raise HTTPException(400, f"Encrypted ZIP entries are not allowed: {path}")
+            if info.is_dir() or is_ignored_archive_path(path):
+                continue
+            raw_members.append((info, path))
+
+        if not raw_members:
+            raise HTTPException(400, f"{filename} does not contain any files")
+
+        raw_paths = [path for _, path in raw_members]
+        if "index.html" in raw_paths:
+            wrapper: str | None = None
+        else:
+            roots = {PurePosixPath(path).parts[0] for path in raw_paths}
+            wrapper = next(iter(roots)) if len(roots) == 1 else None
+            if wrapper is None or f"{wrapper}/index.html" not in raw_paths:
+                raise HTTPException(
+                    400,
+                    f"{filename} must contain index.html at its root or inside one wrapper directory",
+                )
+
+        normalized: list[tuple[zipfile.ZipInfo, str]] = []
+        seen: set[str] = set()
+        total_size = 0
+        total_compressed = 0
+        for info, raw_path in raw_members:
+            path = raw_path
+            if wrapper:
+                prefix = f"{wrapper}/"
+                if not path.startswith(prefix):
+                    raise HTTPException(400, f"ZIP wrapper directory is inconsistent: {path}")
+                path = path[len(prefix) :]
+            path = validate_relative_asset_path(path)
+            folded = path.casefold()
+            if folded in seen:
+                raise HTTPException(400, f"ZIP contains duplicate paths: {path}")
+            seen.add(folded)
+            if info.file_size > ZIP_MAX_FILE_BYTES:
+                raise HTTPException(413, f"ZIP entry is too large: {path}")
+            if info.file_size and info.file_size / max(1, info.compress_size) > ZIP_MAX_COMPRESSION_RATIO:
+                raise HTTPException(413, f"ZIP entry compression ratio is too high: {path}")
+            total_size += info.file_size
+            total_compressed += info.compress_size
+            normalized.append((info, path))
+
+        if len(normalized) > ZIP_MAX_FILES:
+            raise HTTPException(413, f"{filename} contains too many files")
+        if total_size > ZIP_MAX_EXTRACTED_BYTES:
+            raise HTTPException(413, f"{filename} exceeds the extracted size limit")
+        if total_size and total_size / max(1, total_compressed) > ZIP_MAX_COMPRESSION_RATIO:
+            raise HTTPException(413, f"{filename} compression ratio is too high")
+
+        path_set = {path.casefold() for _, path in normalized}
+        for _, path in normalized:
+            parent = PurePosixPath(path).parent
+            while parent != PurePosixPath("."):
+                if parent.as_posix().casefold() in path_set:
+                    raise HTTPException(400, f"ZIP contains a file/directory conflict: {path}")
+                parent = parent.parent
+
+        html_paths = [
+            path
+            for _, path in normalized
+            if PurePosixPath(path).suffix.casefold() in {".html", ".htm"}
+        ]
+        if html_paths != ["index.html"]:
+            raise HTTPException(
+                400,
+                f"{filename} must contain exactly one HTML file named index.html",
+            )
+
+        members = [
+            ArchiveMember(info=info, relative_path=path, media_type=media_type_for_path(path))
+            for info, path in normalized
+        ]
+        return archive, members
+    except Exception:
+        archive.close()
+        raise
+
+
+def copy_to_spooled_file(
+    source: BinaryIO, *, expected_size: int, relative_path: str
+) -> tuple[BinaryIO, int]:
+    output = tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024, mode="w+b")
+    total = 0
+    try:
+        while True:
+            chunk = source.read(STREAM_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > ZIP_MAX_FILE_BYTES:
+                raise HTTPException(413, f"ZIP entry is too large: {relative_path}")
+            output.write(chunk)
+        if total != expected_size:
+            raise HTTPException(400, f"ZIP entry size is invalid: {relative_path}")
+        output.seek(0)
+        return output, total
+    except Exception:
+        output.close()
+        raise
+
+
+def store_uploaded_page(
+    *,
+    upload: UploadFile,
+    filename: str,
+    page_type: str,
+    source_kind: str,
+    project_id: str,
+    page_id: str,
+    backend: str,
+) -> dict[str, Any]:
+    prefix = page_storage_prefix(project_id, page_id, backend)
+    page_stub = {
+        "id": page_id,
+        "storage_backend": backend,
+        "storage_prefix": prefix,
+    }
+    assets: list[dict[str, Any]] = []
+    stored_paths: list[str] = []
+    archive: zipfile.ZipFile | None = None
+    try:
+        if source_kind == "zip":
+            archive, members = inspect_zip(upload, filename)
+            for member in members:
+                try:
+                    with archive.open(member.info, "r") as source:
+                        spool, size = copy_to_spooled_file(
+                            source,
+                            expected_size=member.info.file_size,
+                            relative_path=member.relative_path,
+                        )
+                except (zipfile.BadZipFile, RuntimeError) as exc:
+                    raise HTTPException(
+                        400, f"ZIP entry failed integrity validation: {member.relative_path}"
+                    ) from exc
+                try:
+                    media_type = member.media_type
+                    if member.relative_path == "index.html":
+                        raw = spool.read(HTML_MAX_BYTES + 1)
+                        if len(raw) > HTML_MAX_BYTES:
+                            raise HTTPException(413, "index.html is too large")
+                        prepared = prepare_html_asset(page_id, raw)
+                        spool.close()
+                        spool = io.BytesIO(prepared)
+                        size = len(prepared)
+                        media_type = "text/html; charset=utf-8"
+                    key = f"{prefix}/{member.relative_path}"
+                    store_asset_stream(
+                        backend=backend,
+                        key=key,
+                        fileobj=spool,
+                        size=size,
+                        media_type=media_type,
+                    )
+                    stored_paths.append(member.relative_path)
+                    assets.append(
+                        {
+                            "relative_path": member.relative_path,
+                            "media_type": media_type,
+                            "size_bytes": size,
+                        }
+                    )
+                finally:
+                    spool.close()
+            entry_path = "index.html"
+        else:
+            upload.file.seek(0)
+            size = file_size(upload.file)
+            upload.file.seek(0)
+            if size == 0:
+                raise HTTPException(400, f"{filename} is empty")
+            max_bytes = HTML_MAX_BYTES if page_type == "html" else IMAGE_MAX_BYTES
+            if size > max_bytes:
+                raise HTTPException(413, f"{filename} is too large")
+            if page_type == "html":
+                prepared = prepare_html_asset(page_id, upload.file.read())
+                fileobj: BinaryIO = io.BytesIO(prepared)
+                size = len(prepared)
+                entry_path = "index.html"
+                media_type = "text/html; charset=utf-8"
+            else:
+                fileobj = upload.file
+                suffix = Path(filename).suffix.lower()
+                entry_path = f"image{suffix}"
+                media_type = media_type_for_path(entry_path)
+            store_asset_stream(
+                backend=backend,
+                key=f"{prefix}/{entry_path}",
+                fileobj=fileobj,
+                size=size,
+                media_type=media_type,
+            )
+            stored_paths.append(entry_path)
+            assets.append(
+                {
+                    "relative_path": entry_path,
+                    "media_type": media_type,
+                    "size_bytes": size,
+                }
+            )
+
+        return {
+            "id": page_id,
+            "storage_prefix": prefix,
+            "entry_path": entry_path,
+            "assets": assets,
+            "storage_backend": backend,
+        }
+    except Exception:
+        delete_asset_package(page_stub, stored_paths)
+        raise
+    finally:
+        if archive is not None:
+            archive.close()
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -473,9 +859,19 @@ def api_delete_project(project_id: str):
     get_project(project_id)
     with db() as conn:
         pages = [row_to_dict(r) for r in conn.execute("SELECT * FROM pages WHERE project_id = ?", (project_id,)).fetchall()]
+        asset_paths = {
+            page["id"]: [
+                str(row["relative_path"])
+                for row in conn.execute(
+                    "SELECT relative_path FROM page_assets WHERE page_id = ?",
+                    (page["id"],),
+                ).fetchall()
+            ]
+            for page in pages
+        }
         conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
     for page in pages:
-        delete_asset(page)
+        delete_asset_package(page, asset_paths[page["id"]])
     return {"ok": True}
 
 
@@ -543,11 +939,26 @@ async def api_upload_pages(
     for idx, upload in enumerate(files):
         filename = safe_filename(upload.filename or "page")
         ext = Path(filename).suffix.lower()
-        page_type = "html" if ext in {".html", ".htm"} else "image" if ext in {".png", ".jpg", ".jpeg", ".webp", ".gif"} else None
+        source_kind = "zip" if ext == ".zip" else "single"
+        page_type = (
+            "html"
+            if ext in {".html", ".htm", ".zip"}
+            else "image"
+            if ext in {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+            else None
+        )
         if not page_type:
             raise HTTPException(400, f"Unsupported file type: {filename}")
         name = requested_names[idx] if requested_names else clean_name(Path(filename).stem, kind="Page")
-        prepared.append({"upload": upload, "filename": filename, "ext": ext, "type": page_type, "name": name})
+        prepared.append(
+            {
+                "upload": upload,
+                "filename": filename,
+                "type": page_type,
+                "source_kind": source_kind,
+                "name": name,
+            }
+        )
 
     folded = [item["name"].casefold() for item in prepared]
     if len(folded) != len(set(folded)):
@@ -563,46 +974,66 @@ async def api_upload_pages(
     stored: list[dict[str, Any]] = []
     try:
         for item in prepared:
-            data = await item["upload"].read()
-            if not data:
-                raise HTTPException(400, f'{item["filename"]} is empty')
-            max_bytes = 12 * 1024 * 1024 if item["type"] == "html" else 25 * 1024 * 1024
-            if len(data) > max_bytes:
-                raise HTTPException(413, f'{item["filename"]} is too large')
             page_id = str(uuid.uuid4())
-            media_type = item["upload"].content_type or mimetypes.guess_type(item["filename"])[0] or "application/octet-stream"
-            if item["type"] == "html":
-                data = prepare_html_asset(page_id, data)
-                media_type = "text/html; charset=utf-8"
-            key = asset_key(project_id, page_id, item["ext"], backend)
-            store_asset(backend=backend, key=key, data=data, media_type=media_type)
-            stored.append({**item, "id": page_id, "key": key, "backend": backend})
+            package = await run_in_threadpool(
+                store_uploaded_page,
+                upload=item["upload"],
+                filename=item["filename"],
+                page_type=item["type"],
+                source_kind=item["source_kind"],
+                project_id=project_id,
+                page_id=page_id,
+                backend=backend,
+            )
+            stored.append({**item, **package})
 
         with db() as conn:
             for offset, item in enumerate(stored):
                 conn.execute(
                     """
                     INSERT INTO pages(
-                        id, project_id, name, type, storage_backend, storage_key,
+                        id, project_id, name, type, storage_backend, storage_prefix, entry_path,
                         render_mode, viewport_width, viewport_height, instrumentation_version,
                         sort_order, created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        item["id"], project_id, item["name"], item["type"], backend, item["key"],
+                        item["id"], project_id, item["name"], item["type"], backend,
+                        item["storage_prefix"], item["entry_path"],
                         normalized_render_mode, normalized_viewport_width, normalized_viewport_height,
                         HTML_INSTRUMENTATION_VERSION if item["type"] == "html" else 0,
                         next_order + offset, now_iso(),
                     ),
                 )
+                conn.executemany(
+                    """
+                    INSERT INTO page_assets(page_id, relative_path, media_type, size_bytes)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            item["id"],
+                            asset["relative_path"],
+                            asset["media_type"],
+                            asset["size_bytes"],
+                        )
+                        for asset in item["assets"]
+                    ],
+                )
     except sqlite3.IntegrityError as exc:
         for item in stored:
-            delete_asset({"storage_backend": item["backend"], "storage_key": item["key"]})
+            delete_asset_package(
+                item,
+                [asset["relative_path"] for asset in item["assets"]],
+            )
         raise HTTPException(409, "页面名称在当前项目中已存在") from exc
     except Exception:
         for item in stored:
-            delete_asset({"storage_backend": item["backend"], "storage_key": item["key"]})
+            delete_asset_package(
+                item,
+                [asset["relative_path"] for asset in item["assets"]],
+            )
         raise
 
     return [get_page(item["id"]) for item in stored]
@@ -641,9 +1072,10 @@ def api_update_page(page_id: str, payload: PageUpdate):
 @app.delete("/api/pages/{page_id}")
 def api_delete_page(page_id: str):
     page = get_page(page_id)
+    paths = page_asset_paths(page_id)
     with db() as conn:
         conn.execute("DELETE FROM pages WHERE id = ?", (page_id,))
-    delete_asset(page)
+    delete_asset_package(page, paths)
     return {"ok": True}
 
 
@@ -656,22 +1088,159 @@ def api_page_content_url(page_id: str):
     }
 
 
+def get_page_asset(page_id: str, relative_path: str) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM page_assets
+            WHERE page_id = ? AND relative_path = ?
+            """,
+            (page_id, relative_path),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Asset not found")
+    return row_to_dict(row)
+
+
+def content_headers() -> dict[str, str]:
+    return {
+        "Accept-Ranges": "bytes",
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
+        "Cache-Control": "private, max-age=3600",
+        "Cross-Origin-Resource-Policy": "cross-origin",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    }
+
+
+def can_redirect_to_object_storage(media_type: str) -> bool:
+    base_type = media_type.split(";", 1)[0].strip().lower()
+    if base_type == "image/svg+xml" or "mpegurl" in base_type:
+        return False
+    return base_type.startswith(("image/", "audio/", "video/"))
+
+
+def parse_range_header(value: str | None, size: int) -> tuple[int, int] | None:
+    if not value:
+        return None
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", value.strip())
+    if not match or size <= 0:
+        raise HTTPException(
+            416,
+            "Requested range is not satisfiable",
+            headers={"Content-Range": f"bytes */{size}"},
+        )
+    start_raw, end_raw = match.groups()
+    if not start_raw:
+        suffix_length = int(end_raw or 0)
+        if suffix_length <= 0:
+            raise HTTPException(
+                416,
+                "Requested range is not satisfiable",
+                headers={"Content-Range": f"bytes */{size}"},
+            )
+        start = max(0, size - suffix_length)
+        end = size - 1
+    else:
+        start = int(start_raw)
+        end = min(size - 1, int(end_raw)) if end_raw else size - 1
+    if start >= size or start > end:
+        raise HTTPException(
+            416,
+            "Requested range is not satisfiable",
+            headers={"Content-Range": f"bytes */{size}"},
+        )
+    return start, end
+
+
+@app.api_route(
+    "/content/{page_id}/{token}/{asset_path:path}",
+    methods=["GET", "HEAD", "OPTIONS"],
+)
+def page_asset_content(
+    request: Request,
+    page_id: str,
+    token: str,
+    asset_path: str,
+):
+    if not valid_content_token(page_id, token):
+        raise HTTPException(403, "Content URL is invalid or expired")
+    if request.method == "OPTIONS":
+        headers = content_headers()
+        headers.update(
+            {
+                "Access-Control-Allow-Headers": "Range",
+                "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            }
+        )
+        return Response(status_code=204, headers=headers)
+    try:
+        relative_path = validate_relative_asset_path(asset_path)
+    except HTTPException as exc:
+        raise HTTPException(404, "Asset not found") from exc
+    page = get_page(page_id)
+    asset = get_page_asset(page_id, relative_path)
+    size = int(asset["size_bytes"])
+    media_type = str(asset["media_type"])
+    headers = content_headers()
+    byte_range = parse_range_header(request.headers.get("range"), size)
+
+    if page["storage_backend"] == "local":
+        path = local_asset_path(asset_storage_key(page, relative_path))
+        if not path.is_file():
+            raise HTTPException(404, "Asset not found")
+        return FileResponse(path, media_type=media_type, headers=headers)
+
+    if page["storage_backend"] != "s3":
+        raise HTTPException(500, "Unsupported storage backend")
+
+    settings = object_storage_settings()
+    if request.method == "GET" and settings.direct_read and can_redirect_to_object_storage(media_type):
+        try:
+            signed = object_storage().presign_get(asset_storage_key(page, relative_path))
+        except ObjectStorageConfigurationError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(502, "Failed to create an object storage access URL") from exc
+        return RedirectResponse(signed.url, status_code=307, headers=headers)
+
+    if byte_range:
+        start, end = byte_range
+        status_code = 206
+        content_length = end - start + 1
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    else:
+        start = end = None
+        status_code = 200
+        content_length = size
+    headers["Content-Length"] = str(content_length)
+    if request.method == "HEAD":
+        return Response(status_code=status_code, media_type=media_type, headers=headers)
+    try:
+        stream = object_storage().iter_bytes(
+            asset_storage_key(page, relative_path),
+            start=start,
+            end=end,
+        )
+    except ObjectStorageConfigurationError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, "Failed to read asset") from exc
+    return StreamingResponse(
+        stream,
+        status_code=status_code,
+        media_type=media_type,
+        headers=headers,
+    )
+
+
 @app.get("/api/pages/{page_id}/file")
 def api_page_file(page_id: str):
     page = get_page(page_id)
     if page["type"] != "image":
         raise HTTPException(400, "Not an image page")
-    if page["storage_backend"] == "s3" and object_storage_settings().direct_read:
-        return RedirectResponse(page_to_api(page)["content_url"], status_code=307)
-    try:
-        content = read_asset(page)
-    except FileNotFoundError:
-        raise HTTPException(404, "Asset not found")
-    except Exception as exc:
-        raise HTTPException(502, f"Failed to read asset: {exc}") from exc
-    suffix = Path(page["storage_key"]).suffix
-    media_type = mimetypes.guess_type(f"x{suffix}")[0] or "application/octet-stream"
-    return Response(content=content, media_type=media_type, headers={"Cache-Control": "private, max-age=60"})
+    return RedirectResponse(page_to_api(page)["content_url"], status_code=307)
 
 
 def strip_html_instrumentation(source: str) -> str:
@@ -996,10 +1565,10 @@ def ensure_html_instrumentation(page: dict[str, Any]) -> dict[str, Any]:
     if version >= HTML_INSTRUMENTATION_VERSION:
         return item
     try:
-        prepared = prepare_html_asset(item["id"], read_asset(item))
-        store_asset(
+        prepared = prepare_html_asset(item["id"], read_page_asset(item))
+        store_asset_bytes(
             backend=item["storage_backend"],
-            key=item["storage_key"],
+            key=asset_storage_key(item, item["entry_path"]),
             data=prepared,
             media_type="text/html; charset=utf-8",
         )
@@ -1014,6 +1583,19 @@ def ensure_html_instrumentation(page: dict[str, Any]) -> dict[str, Any]:
             "UPDATE pages SET instrumentation_version = ? WHERE id = ?",
             (HTML_INSTRUMENTATION_VERSION, item["id"]),
         )
+        conn.execute(
+            """
+            UPDATE page_assets
+            SET size_bytes = ?, media_type = ?
+            WHERE page_id = ? AND relative_path = ?
+            """,
+            (
+                len(prepared),
+                "text/html; charset=utf-8",
+                item["id"],
+                item["entry_path"],
+            ),
+        )
     item["instrumentation_version"] = HTML_INSTRUMENTATION_VERSION
     return item
 
@@ -1025,19 +1607,8 @@ def api_render_html(page_id: str, mode: str = "edit"):
         raise HTTPException(400, "Not an HTML page")
     if mode not in {"edit", "play"}:
         mode = "edit"
-    if page["storage_backend"] == "s3" and object_storage_settings().direct_read:
-        target = page_to_api(page)["content_url"] + f"#uipm-mode={mode}"
-        return RedirectResponse(target, status_code=307)
-    try:
-        raw = read_asset(page)
-    except FileNotFoundError:
-        raise HTTPException(404, "Asset not found")
-    except Exception as exc:
-        raise HTTPException(502, f"Failed to read asset: {exc}") from exc
-    return HTMLResponse(
-        raw.decode("utf-8", errors="replace"),
-        headers={"Cache-Control": "private, max-age=3600"},
-    )
+    target = page_to_api(page)["content_url"] + f"#uipm-mode={mode}"
+    return RedirectResponse(target, status_code=307)
 
 
 def normalize_interaction_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:

@@ -5,9 +5,9 @@
 ## 功能
 
 - 项目创建 / 删除
-- HTML、PNG/JPG/WebP/GIF 单个或批量上传
+- HTML、ZIP 页面包、PNG/JPG/WebP/GIF 单个或批量上传
 - 每次上传可选择 **本地** 或 **S3-compatible** 存储
-- S3/OSS 页面通过私有对象的短期预签名 URL 由浏览器直读，不占用应用服务器下载带宽
+- S3/OSS 图片、音视频通过私有对象的短期预签名 URL 由浏览器直读；HTML/CSS/JS 由应用返回以保持相对路径语义
 - 上传前可逐个修改 HTML / 图片名称，创建后可继续重命名
 - 同一项目内 **HTML + 图片名称唯一**，大小写不敏感
 - HTML：点击 DOM 元素创建交互
@@ -204,11 +204,12 @@ export UIPM_S3_ENDPOINT_URL=https://oss-cn-chengdu-internal.aliyuncs.com
 
 `UIPM_S3_PREFIX`、`UIPM_S3_DIRECT_READ`、`UIPM_S3_PRESIGN_TTL_SECONDS` 等均已有合理默认值，一般无需配置。`UIPM_S3_BROWSER_ENDPOINT_URL` 只保留给 MinIO、R2 等通用 S3-compatible 服务，OSS 不需要使用。
 
-对象 Key 使用稳定 UUID：
+对象 Key 使用稳定 UUID 和页面内相对路径：
 
 ```text
-<prefix>/<project-id>/<page-id>.html
-<prefix>/<project-id>/<page-id>.png
+<prefix>/<project-id>/<page-id>/index.html
+<prefix>/<project-id>/<page-id>/css/app.css
+<prefix>/<project-id>/<page-id>/images/logo.png
 ```
 
 页面重命名不会改变底层 Object Key。
@@ -287,7 +288,9 @@ Project
  │   ├─ name              项目内页面唯一
  │   ├─ type              html / image
  │   ├─ storage_backend   local / s3
- │   └─ storage_key
+ │   ├─ storage_prefix
+ │   ├─ entry_path
+ │   └─ PageAsset[]       相对路径、媒体类型、文件大小
  └─ Interaction
      ├─ name              项目内交互唯一
      ├─ source_page_id
@@ -301,6 +304,6 @@ Project
 
 ## 9. 当前边界
 
-当前版本定位为可信本地/内网工具，只支持独立单 HTML 文件，不处理 HTML 引用的相对 CSS/JS/图片资源包；暂不实现 HTML/CSS/JS 编辑、组件拖拽、页面排序、多人账号、复杂权限、版本控制、条件跳转、动画转场、跨项目跳转、S3 Bucket 自动创建。
+ZIP 页面包必须在根目录或唯一的单层包装目录中包含 `index.html`，且一个 ZIP 只包含一个 HTML 文件；包内相对 CSS/JS/图片/字体/音视频资源会保留目录结构。暂不支持以 `/` 开头的站点根路径、多 HTML 文档页面包、HTML/CSS/JS 编辑、组件拖拽、页面排序、多人账号、复杂权限、版本控制、条件跳转、动画转场、跨项目跳转、S3 Bucket 自动创建。
 
 上传 HTML 使用 `sandbox="allow-scripts"` iframe。如果未来允许不可信外部用户上传 HTML，建议增加独立资源域、HTML 清洗和更严格 CSP。

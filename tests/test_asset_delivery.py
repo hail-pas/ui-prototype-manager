@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from fastapi import Request
+
+import app.main as main
 from app import object_storage as object_storage_module
 from app.main import instrument_html, page_to_api, prepare_html_asset
 from app.object_storage import (
     ObjectStorageConfigurationError,
     ObjectStorageSettings,
     OssObjectStorage,
-    PresignedObject,
     S3ObjectStorage,
     object_storage_settings,
 )
@@ -56,45 +59,93 @@ class HtmlInstrumentationTests(unittest.TestCase):
 
 
 class PageSerializationTests(unittest.TestCase):
-    def test_local_page_uses_application_content_route(self) -> None:
+    @patch.dict(os.environ, {"UIPM_ACCESS_KEY": "test-secret"})
+    def test_page_uses_scoped_content_route(self) -> None:
         page = {
             "id": "local-page",
             "type": "image",
             "storage_backend": "local",
-            "storage_key": "assets/project/local-page.png",
+            "storage_prefix": "assets/project/local-page",
+            "entry_path": "image.png",
         }
 
         result = page_to_api(page)
 
-        self.assertEqual(result["content_url"], "/api/pages/local-page/file")
-        self.assertIsNone(result["content_url_expires_at"])
+        self.assertTrue(result["content_url"].startswith("/content/local-page/"))
+        self.assertTrue(result["content_url"].endswith("/image.png"))
+        self.assertIsNotNone(result["content_url_expires_at"])
 
-    @patch("app.main.object_storage")
-    def test_s3_page_uses_presigned_content_url(self, storage_factory) -> None:
-        storage_factory.return_value.presign_get.return_value = PresignedObject(
-            url="https://assets.example.com/page.html?signature=one",
-            expires_at="2030-01-01T00:00:00+00:00",
-        )
+    @patch.dict(os.environ, {"UIPM_ACCESS_KEY": "test-secret"})
+    def test_s3_html_also_uses_content_gateway(self) -> None:
         page = {
             "id": "s3-page",
             "type": "html",
             "storage_backend": "s3",
-            "storage_key": "uipm/project/s3-page.html",
+            "storage_prefix": "uipm/project/s3-page",
+            "entry_path": "index.html",
         }
-        env = {
+
+        result = page_to_api(page)
+
+        self.assertTrue(result["content_url"].startswith("/content/s3-page/"))
+        self.assertTrue(result["content_url"].endswith("/index.html"))
+
+
+class ContentGatewayTests(unittest.TestCase):
+    @patch.dict(
+        os.environ,
+        {
+            "UIPM_ACCESS_KEY": "test-secret",
             "UIPM_S3_BUCKET": "prototype-assets",
             "UIPM_S3_DIRECT_READ": "true",
+        },
+    )
+    @patch("app.main.object_storage")
+    @patch("app.main.get_page_asset")
+    @patch("app.main.get_page")
+    def test_s3_leaf_asset_redirects_after_token_validation(
+        self,
+        get_page,
+        get_page_asset,
+        storage_factory,
+    ) -> None:
+        get_page.return_value = {
+            "id": "page-a",
+            "storage_backend": "s3",
+            "storage_prefix": "uipm/project-a/page-a",
         }
-
-        with patch.dict(os.environ, env, clear=False):
-            result = page_to_api(page)
-
-        self.assertEqual(
-            result["content_url"], "https://assets.example.com/page.html?signature=one"
+        get_page_asset.return_value = {
+            "relative_path": "video/demo.mp4",
+            "media_type": "video/mp4",
+            "size_bytes": 10,
+        }
+        storage_factory.return_value.presign_get.return_value = SimpleNamespace(
+            url="https://assets.example.com/video.mp4?signature=one"
         )
-        self.assertEqual(result["content_url_expires_at"], "2030-01-01T00:00:00+00:00")
+        token, _ = main.create_content_token("page-a")
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/content/page-a/token/video/demo.mp4",
+                "headers": [],
+            }
+        )
+
+        response = main.page_asset_content(
+            request,
+            page_id="page-a",
+            token=token,
+            asset_path="video/demo.mp4",
+        )
+
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(
+            response.headers["location"],
+            "https://assets.example.com/video.mp4?signature=one",
+        )
         storage_factory.return_value.presign_get.assert_called_once_with(
-            page["storage_key"]
+            "uipm/project-a/page-a/video/demo.mp4"
         )
 
 

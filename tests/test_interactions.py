@@ -26,8 +26,11 @@ class InteractionUpdateTests(unittest.TestCase):
             )
             connection.executemany(
                 """
-                INSERT INTO pages(id, project_id, name, type, storage_backend, storage_key, created_at)
-                VALUES (?, ?, ?, 'image', 'local', ?, ?)
+                INSERT INTO pages(
+                    id, project_id, name, type, storage_backend,
+                    storage_prefix, entry_path, created_at
+                )
+                VALUES (?, ?, ?, 'image', 'local', ?, 'image.png', ?)
                 """,
                 [
                     ("source", "project-a", "Source", "source.png", created_at),
@@ -150,10 +153,10 @@ class HtmlInstrumentationUpgradeTests(unittest.TestCase):
         main.DATA_DIR, main.DB_PATH, main.ASSET_DIR = self.previous_paths
         self.temp_dir.cleanup()
 
-    def test_legacy_local_html_is_upgraded_once(self) -> None:
+    def test_outdated_local_html_is_upgraded_once(self) -> None:
         created_at = main.now_iso()
-        key = "assets/project-a/page-a.html"
-        path = main.local_asset_path(key)
+        prefix = "assets/project-a/page-a"
+        path = main.local_asset_path(f"{prefix}/index.html")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             '<body><button>Open</button><style id="__uipm_style">old</style>'
@@ -168,10 +171,18 @@ class HtmlInstrumentationUpgradeTests(unittest.TestCase):
             connection.execute(
                 """
                 INSERT INTO pages(
-                    id, project_id, name, type, storage_backend, storage_key, created_at
-                ) VALUES (?, ?, ?, 'html', 'local', ?, ?)
+                    id, project_id, name, type, storage_backend,
+                    storage_prefix, entry_path, created_at
+                ) VALUES (?, ?, ?, 'html', 'local', ?, 'index.html', ?)
                 """,
-                ("page-a", "project-a", "Page A", key, created_at),
+                ("page-a", "project-a", "Page A", prefix, created_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO page_assets(page_id, relative_path, media_type, size_bytes)
+                VALUES ('page-a', 'index.html', 'text/html; charset=utf-8', ?)
+                """,
+                (path.stat().st_size,),
             )
 
         upgraded = main.ensure_html_instrumentation(main.get_page("page-a"))
