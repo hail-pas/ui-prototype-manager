@@ -9,7 +9,7 @@ const menuLayer = document.getElementById('playerMenuLayer');
 const menuBackdrop = document.getElementById('playerMenuBackdrop');
 const menuCloseBtn = document.getElementById('menuCloseBtn');
 
-let state = {pages: [], interactions: []};
+let state = {pages: [], interactions: [], overlays: []};
 let historyStack = [];
 let currentPageId = null;
 let frameController = null;
@@ -30,6 +30,12 @@ function page(pageId) {
 
 function interactions(pageId) {
   return state.interactions.filter((item) => item.source_page_id === pageId);
+}
+
+function overlays(pageId) {
+  return state.overlays
+    .filter((item) => item.page_id === pageId)
+    .sort((left, right) => left.z_index - right.z_index || left.created_at.localeCompare(right.created_at));
 }
 
 function focusableMenuElements() {
@@ -104,9 +110,69 @@ async function refreshPageContentUrl(item) {
   await contentUrlRefreshes.get(item.id);
 }
 
+function overlayContentUrl(item) {
+  return new URL(item.content_url || `/api/overlays/${item.id}/content-url`, location.href).href;
+}
+
+async function refreshOverlayContentUrl(item) {
+  const refreshKey = `overlay:${item.id}`;
+  if (!contentUrlRefreshes.has(refreshKey)) {
+    const refresh = api(`/api/overlays/${item.id}/content-url`)
+      .then((data) => Object.assign(item, data))
+      .finally(() => contentUrlRefreshes.delete(refreshKey));
+    contentUrlRefreshes.set(refreshKey, refresh);
+  }
+  await contentUrlRefreshes.get(refreshKey);
+}
+
+function createPlayerOverlay(item) {
+  const media = document.createElement(item.type === 'video' ? 'video' : 'img');
+  media.className = `player-overlay is-${item.type}`;
+  media.draggable = false;
+  media.style.objectFit = item.object_fit;
+  Object.assign(media.style, {
+    left: `${item.x * 100}%`,
+    top: `${item.y * 100}%`,
+    width: `${item.width * 100}%`,
+    height: `${item.height * 100}%`,
+  });
+  if (item.type === 'video') {
+    media.autoplay = true;
+    media.muted = true;
+    media.defaultMuted = true;
+    media.controls = Boolean(item.video_controls);
+    media.playsInline = true;
+    media.preload = 'metadata';
+    media.addEventListener('canplay', () => {
+      const playback = media.play();
+      if (playback) playback.catch(() => {});
+    }, {once: true});
+  } else {
+    media.alt = '';
+  }
+  media.src = overlayContentUrl(item);
+  media.addEventListener('error', async () => {
+    if (media.dataset.contentUrlRetried === 'true') return;
+    media.dataset.contentUrlRetried = 'true';
+    try {
+      await refreshOverlayContentUrl(item);
+      if (item.page_id === currentPageId && media.isConnected) media.src = overlayContentUrl(item);
+    } catch {}
+  });
+  return media;
+}
+
+function renderPlayerOverlays(container, pageId) {
+  const layer = document.createElement('div');
+  layer.className = 'overlay-layer player-overlay-layer';
+  layer.replaceChildren(...overlays(pageId).map(createPlayerOverlay));
+  container.appendChild(layer);
+}
+
 async function load() {
   try {
     state = await api(`/api/projects/${projectId}`);
+    state.overlays = Array.isArray(state.overlays) ? state.overlays : [];
   } catch (error) {
     stage.innerHTML = `<div class="player-empty">${esc(error.message)}</div>`;
     return;
@@ -212,6 +278,7 @@ async function render() {
       viewportWidth: currentPage.viewport_width || 1920,
       viewportHeight: currentPage.viewport_height || 1080,
     });
+    renderPlayerOverlays(frameController.viewport, currentPage.id);
     return;
   }
 
@@ -231,6 +298,7 @@ async function render() {
       stage.innerHTML = `<div class="player-empty">${esc(error.message)}</div>`;
     }
   });
+  renderPlayerOverlays(imageStage, currentPage.id);
   interactions(currentPage.id).filter((item) => item.kind === 'region').forEach((interaction) => {
     const region = interaction.payload;
     const hotspot = document.createElement('button');

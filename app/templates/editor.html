@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{{ project.name }} · UI Prototype Manager</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260827-upload-progress-2" />
+  <link rel="stylesheet" href="/static/app.css?v=20260827-media-overlay-highlight" />
 </head>
 <body class="editor-body">
   <div id="app" data-project-id="{{ project.id }}" class="editor-shell">
@@ -33,6 +33,22 @@
     </main>
 
     <aside class="sidebar right-sidebar">
+      <section id="overlayElementsSection" class="overlay-elements-section">
+        <div class="panel-heading"><span>页面元素</span><span id="overlayCount" class="count-pill">0</span></div>
+        <div class="overlay-add-actions">
+          <label class="ghost-btn overlay-add-btn">＋ 图片<input id="overlayImageInput" type="file" accept=".png,.jpg,.jpeg,.webp,.gif" hidden /></label>
+          <label class="ghost-btn overlay-add-btn">＋ 视频<input id="overlayVideoInput" type="file" accept=".mp4,.webm" hidden /></label>
+        </div>
+        <div id="overlayUploadStatus" class="overlay-upload-status" role="status" aria-live="polite" hidden>
+          <span class="upload-spinner" aria-hidden="true"></span>
+          <span class="overlay-upload-copy">
+            <strong id="overlayUploadTitle">正在上传并处理媒体…</strong>
+            <span id="overlayUploadDetail"></span>
+          </span>
+        </div>
+        <div id="overlaySelectionPanel" class="overlay-selection-panel" hidden></div>
+        <div id="overlayList" class="overlay-list"></div>
+      </section>
       <section id="renderSettingsSection" class="render-settings-section" hidden>
         <div class="panel-heading">HTML 显示</div>
         <div id="renderSettingsPanel" class="render-settings-panel"></div>
@@ -90,7 +106,7 @@
     </form>
   </dialog>
 
-  <script src="/static/frame-fit.js"></script>
-  <script src="/static/editor.js?v=20260827-zip-pages"></script>
+  <script src="/static/frame-fit.js?v=20260827-media-overlay"></script>
+  <script src="/static/editor.js?v=20260827-media-overlay-highlight"></script>
 </body>
 </html>

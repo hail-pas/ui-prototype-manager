@@ -137,6 +137,8 @@
     iframe.src = options.src;
 
     return {
+      wrap,
+      viewport,
       iframe,
       ownsMessage(event) { return event.source === iframe.contentWindow; },
       send(message) {

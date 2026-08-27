@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import mimetypes
 import os
 import re
@@ -12,6 +13,7 @@ import secrets
 import shutil
 import sqlite3
 import stat
+import struct
 import tempfile
 import time
 import uuid
@@ -19,7 +21,7 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Iterator
 from urllib.parse import quote
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
@@ -56,6 +58,19 @@ ZIP_MAX_COMPRESSION_RATIO = 200
 ZIP_MAX_PATH_LENGTH = 512
 HTML_MAX_BYTES = 20 * 1024 * 1024
 IMAGE_MAX_BYTES = 25 * 1024 * 1024
+OVERLAY_IMAGE_MAX_BYTES = 25 * 1024 * 1024
+OVERLAY_VIDEO_MAX_BYTES = 100 * 1024 * 1024
+OVERLAY_DEFAULT_WIDTH = 0.3
+OVERLAY_MAX_Z_INDEX = 1000
+OVERLAY_MEDIA_TYPES = {
+    ".png": ("image", "image/png"),
+    ".jpg": ("image", "image/jpeg"),
+    ".jpeg": ("image", "image/jpeg"),
+    ".webp": ("image", "image/webp"),
+    ".gif": ("image", "image/gif"),
+    ".mp4": ("video", "video/mp4"),
+    ".webm": ("video", "video/webm"),
+}
 STREAM_CHUNK_BYTES = 1024 * 1024
 
 app = FastAPI(title="UI Prototype Manager", version="0.5.0")
@@ -126,6 +141,7 @@ async def auth_middleware(request: Request, call_next):
         or path == "/health"
         or path.startswith("/static/")
         or path.startswith("/content/")
+        or path.startswith("/overlay-content/")
     )
     if public or valid_token(request.cookies.get(TOKEN_COOKIE)):
         return await call_next(request)
@@ -198,6 +214,31 @@ def init_db() -> None:
                 FOREIGN KEY(target_page_id) REFERENCES pages(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS overlays (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                page_id TEXT NOT NULL,
+                type TEXT NOT NULL CHECK(type IN ('image', 'video')),
+                storage_backend TEXT NOT NULL CHECK(storage_backend IN ('local', 's3')),
+                storage_key TEXT NOT NULL,
+                media_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
+                x REAL NOT NULL CHECK(x >= 0 AND x <= 1),
+                y REAL NOT NULL CHECK(y >= 0 AND y <= 1),
+                width REAL NOT NULL CHECK(width > 0 AND width <= 1),
+                height REAL NOT NULL CHECK(height > 0 AND height <= 1),
+                aspect_ratio REAL NOT NULL CHECK(aspect_ratio > 0),
+                object_fit TEXT NOT NULL DEFAULT 'cover' CHECK(object_fit IN ('contain', 'cover')),
+                z_index INTEGER NOT NULL DEFAULT 0 CHECK(z_index >= 0 AND z_index <= 1000),
+                video_controls INTEGER NOT NULL DEFAULT 1 CHECK(video_controls IN (0, 1)),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK(x + width <= 1.000000001),
+                CHECK(y + height <= 1.000000001),
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(page_id) REFERENCES pages(id) ON DELETE CASCADE
+            );
+
             CREATE UNIQUE INDEX IF NOT EXISTS uq_pages_project_name
                 ON pages(project_id, name COLLATE NOCASE);
             CREATE UNIQUE INDEX IF NOT EXISTS uq_interactions_project_name
@@ -206,6 +247,8 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_interactions_project ON interactions(project_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_interactions_source ON interactions(source_page_id);
             CREATE INDEX IF NOT EXISTS idx_interactions_target ON interactions(target_page_id);
+            CREATE INDEX IF NOT EXISTS idx_overlays_page
+                ON overlays(page_id, z_index, created_at);
             """
         )
         page_columns = {
@@ -260,6 +303,14 @@ def get_interaction(interaction_id: str) -> dict[str, Any]:
     return item
 
 
+def get_overlay(overlay_id: str) -> dict[str, Any]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM overlays WHERE id = ?", (overlay_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Overlay not found")
+    return row_to_dict(row)
+
+
 def clean_name(name: str, *, kind: str) -> str:
     value = re.sub(r"\s+", " ", str(name or "").strip())[:120]
     if not value:
@@ -300,6 +351,16 @@ def s3_configured() -> bool:
 
 def page_storage_prefix(project_id: str, page_id: str, backend: str) -> str:
     tail = f"{project_id}/{page_id}"
+    if backend == "local":
+        return f"assets/{tail}"
+    prefix = object_storage_settings().prefix
+    return f"{prefix}/{tail}" if prefix else tail
+
+
+def overlay_storage_key(
+    project_id: str, overlay_id: str, suffix: str, backend: str
+) -> str:
+    tail = f"{project_id}/overlays/{overlay_id}{suffix}"
     if backend == "local":
         return f"assets/{tail}"
     prefix = object_storage_settings().prefix
@@ -399,6 +460,31 @@ def delete_asset_package(
             pass
 
 
+def delete_overlay_asset(
+    overlay: dict[str, Any], *, suppress_errors: bool = False
+) -> None:
+    try:
+        backend = str(overlay["storage_backend"])
+        key = str(overlay["storage_key"])
+        if backend == "local":
+            path = local_asset_path(key)
+            path.unlink(missing_ok=True)
+            try:
+                path.parent.rmdir()
+            except OSError:
+                pass
+            return
+        if backend == "s3":
+            if not s3_configured():
+                raise ObjectStorageConfigurationError("S3 is not configured on the server")
+            object_storage().delete(key)
+            return
+        raise RuntimeError(f"Unsupported storage backend: {backend}")
+    except Exception:
+        if not suppress_errors:
+            raise
+
+
 def create_content_token(page_id: str) -> tuple[str, int]:
     expires_at = int(time.time()) + CONTENT_TOKEN_TTL_SECONDS
     message = f"uipm-content-v1:{page_id}:{expires_at}".encode("utf-8")
@@ -427,6 +513,18 @@ def page_to_api(page: dict[str, Any]) -> dict[str, Any]:
     token, expires_at = create_content_token(str(item["id"]))
     entry_path = quote(str(item["entry_path"]), safe="/")
     item["content_url"] = f'/content/{item["id"]}/{token}/{entry_path}'
+    item["content_url_expires_at"] = datetime.fromtimestamp(
+        expires_at, tz=timezone.utc
+    ).isoformat()
+    return item
+
+
+def overlay_to_api(overlay: dict[str, Any]) -> dict[str, Any]:
+    item = dict(overlay)
+    item["video_controls"] = bool(item.get("video_controls"))
+    token, expires_at = create_content_token(f'overlay:{item["id"]}')
+    asset_name = quote(Path(str(item["storage_key"])).name, safe="")
+    item["content_url"] = f'/overlay-content/{item["id"]}/{token}/{asset_name}'
     item["content_url_expires_at"] = datetime.fromtimestamp(
         expires_at, tz=timezone.utc
     ).isoformat()
@@ -463,6 +561,16 @@ class InteractionUpdate(BaseModel):
     target_page_id: str | None = None
 
 
+class OverlayUpdate(BaseModel):
+    x: float | None = None
+    y: float | None = None
+    width: float | None = None
+    height: float | None = None
+    object_fit: str | None = None
+    z_index: int | None = None
+    video_controls: bool | None = None
+
+
 @dataclass(frozen=True)
 class ArchiveMember:
     info: zipfile.ZipInfo
@@ -476,6 +584,374 @@ def file_size(fileobj: BinaryIO) -> int:
     size = fileobj.tell()
     fileobj.seek(position)
     return size
+
+
+def _positive_dimensions(width: int, height: int) -> tuple[int, int]:
+    if width <= 0 or height <= 0 or width > 100_000 or height > 100_000:
+        raise ValueError("Media dimensions are invalid")
+    return width, height
+
+
+def probe_image_dimensions(fileobj: BinaryIO, suffix: str) -> tuple[int, int]:
+    original_position = fileobj.tell()
+    try:
+        fileobj.seek(0)
+        header = fileobj.read(32)
+        if suffix == ".png":
+            if header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+                raise ValueError("Invalid PNG file")
+            return _positive_dimensions(*struct.unpack(">II", header[16:24]))
+
+        if suffix == ".gif":
+            if header[:6] not in {b"GIF87a", b"GIF89a"}:
+                raise ValueError("Invalid GIF file")
+            width, height = struct.unpack("<HH", header[6:10])
+            return _positive_dimensions(width, height)
+
+        if suffix in {".jpg", ".jpeg"}:
+            if header[:2] != b"\xff\xd8":
+                raise ValueError("Invalid JPEG file")
+            fileobj.seek(2)
+            sof_markers = {
+                0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+            }
+            while True:
+                prefix = fileobj.read(1)
+                if not prefix:
+                    break
+                if prefix != b"\xff":
+                    continue
+                marker_raw = fileobj.read(1)
+                while marker_raw == b"\xff":
+                    marker_raw = fileobj.read(1)
+                if not marker_raw:
+                    break
+                marker = marker_raw[0]
+                if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+                    continue
+                length_raw = fileobj.read(2)
+                if len(length_raw) != 2:
+                    break
+                segment_length = struct.unpack(">H", length_raw)[0]
+                if segment_length < 2:
+                    raise ValueError("Invalid JPEG segment")
+                if marker in sof_markers:
+                    dimensions = fileobj.read(5)
+                    if len(dimensions) != 5:
+                        break
+                    height, width = struct.unpack(">HH", dimensions[1:5])
+                    return _positive_dimensions(width, height)
+                fileobj.seek(segment_length - 2, os.SEEK_CUR)
+            raise ValueError("JPEG dimensions were not found")
+
+        if suffix == ".webp":
+            if header[:4] != b"RIFF" or header[8:12] != b"WEBP":
+                raise ValueError("Invalid WebP file")
+            fileobj.seek(12)
+            total_size = file_size(fileobj)
+            while fileobj.tell() + 8 <= total_size:
+                chunk_type = fileobj.read(4)
+                chunk_size_raw = fileobj.read(4)
+                if len(chunk_type) != 4 or len(chunk_size_raw) != 4:
+                    break
+                chunk_size = struct.unpack("<I", chunk_size_raw)[0]
+                payload_start = fileobj.tell()
+                if chunk_type == b"VP8X" and chunk_size >= 10:
+                    payload = fileobj.read(10)
+                    width = 1 + int.from_bytes(payload[4:7], "little")
+                    height = 1 + int.from_bytes(payload[7:10], "little")
+                    return _positive_dimensions(width, height)
+                if chunk_type == b"VP8 " and chunk_size >= 10:
+                    payload = fileobj.read(10)
+                    if payload[3:6] != b"\x9d\x01\x2a":
+                        raise ValueError("Invalid WebP VP8 frame")
+                    width = int.from_bytes(payload[6:8], "little") & 0x3FFF
+                    height = int.from_bytes(payload[8:10], "little") & 0x3FFF
+                    return _positive_dimensions(width, height)
+                if chunk_type == b"VP8L" and chunk_size >= 5:
+                    payload = fileobj.read(5)
+                    if payload[0] != 0x2F:
+                        raise ValueError("Invalid WebP VP8L frame")
+                    bits = int.from_bytes(payload[1:5], "little")
+                    width = (bits & 0x3FFF) + 1
+                    height = ((bits >> 14) & 0x3FFF) + 1
+                    return _positive_dimensions(width, height)
+                next_chunk = payload_start + chunk_size + (chunk_size % 2)
+                if next_chunk > total_size:
+                    break
+                fileobj.seek(next_chunk)
+            raise ValueError("WebP dimensions were not found")
+
+        raise ValueError("Unsupported image type")
+    finally:
+        fileobj.seek(original_position)
+
+
+def _iter_mp4_boxes(
+    fileobj: BinaryIO, start: int, end: int
+) -> Iterator[tuple[bytes, int, int]]:
+    cursor = start
+    while cursor + 8 <= end:
+        fileobj.seek(cursor)
+        header = fileobj.read(8)
+        if len(header) != 8:
+            return
+        size = struct.unpack(">I", header[:4])[0]
+        box_type = header[4:8]
+        header_size = 8
+        if size == 1:
+            extended = fileobj.read(8)
+            if len(extended) != 8:
+                return
+            size = struct.unpack(">Q", extended)[0]
+            header_size = 16
+        elif size == 0:
+            size = end - cursor
+        if size < header_size or cursor + size > end:
+            return
+        yield box_type, cursor + header_size, cursor + size
+        cursor += size
+
+
+def _mp4_video_track_dimensions(
+    fileobj: BinaryIO, track_start: int, track_end: int
+) -> tuple[int, int] | None:
+    track_header: tuple[int, int] | None = None
+    media_box: tuple[int, int] | None = None
+    for box_type, payload_start, box_end in _iter_mp4_boxes(
+        fileobj, track_start, track_end
+    ):
+        if box_type == b"tkhd":
+            track_header = (payload_start, box_end)
+        elif box_type == b"mdia":
+            media_box = (payload_start, box_end)
+    if not track_header or not media_box:
+        return None
+
+    is_video = False
+    for box_type, payload_start, box_end in _iter_mp4_boxes(
+        fileobj, media_box[0], media_box[1]
+    ):
+        if box_type != b"hdlr" or box_end - payload_start < 12:
+            continue
+        fileobj.seek(payload_start + 8)
+        is_video = fileobj.read(4) == b"vide"
+        break
+    if not is_video:
+        return None
+
+    payload_start, box_end = track_header
+    if box_end - payload_start < 8:
+        return None
+    fileobj.seek(box_end - 8)
+    raw = fileobj.read(8)
+    if len(raw) != 8:
+        return None
+    width_fixed, height_fixed = struct.unpack(">II", raw)
+    width = round(width_fixed / 65536)
+    height = round(height_fixed / 65536)
+    try:
+        return _positive_dimensions(width, height)
+    except ValueError:
+        return None
+
+
+def probe_mp4_dimensions(fileobj: BinaryIO) -> tuple[int, int]:
+    original_position = fileobj.tell()
+    try:
+        total_size = file_size(fileobj)
+        moov: tuple[int, int] | None = None
+        has_mp4_signature = False
+        for box_type, payload_start, box_end in _iter_mp4_boxes(fileobj, 0, total_size):
+            if box_type in {b"ftyp", b"moov"}:
+                has_mp4_signature = True
+            if box_type == b"moov":
+                moov = (payload_start, box_end)
+        if not has_mp4_signature or not moov:
+            raise ValueError("Invalid MP4 file")
+        for box_type, payload_start, box_end in _iter_mp4_boxes(
+            fileobj, moov[0], moov[1]
+        ):
+            if box_type != b"trak":
+                continue
+            dimensions = _mp4_video_track_dimensions(fileobj, payload_start, box_end)
+            if dimensions:
+                return dimensions
+        raise ValueError("MP4 video dimensions were not found")
+    finally:
+        fileobj.seek(original_position)
+
+
+def _ebml_vint(data: bytes, offset: int) -> tuple[int, int] | None:
+    if offset >= len(data) or data[offset] == 0:
+        return None
+    marker = 0x80
+    length = 1
+    while length <= 8 and not data[offset] & marker:
+        marker >>= 1
+        length += 1
+    if length > 8 or offset + length > len(data):
+        return None
+    value = data[offset] & (marker - 1)
+    for byte in data[offset + 1:offset + length]:
+        value = (value << 8) | byte
+    return value, length
+
+
+def _webm_uint_element(data: bytes, element_id: int) -> int | None:
+    needle = bytes((element_id,))
+    cursor = 0
+    while True:
+        cursor = data.find(needle, cursor)
+        if cursor < 0:
+            return None
+        size_info = _ebml_vint(data, cursor + 1)
+        if size_info:
+            size, size_length = size_info
+            value_start = cursor + 1 + size_length
+            value_end = value_start + size
+            if 0 < size <= 4 and value_end <= len(data):
+                value = int.from_bytes(data[value_start:value_end], "big")
+                if 0 < value <= 100_000:
+                    return value
+        cursor += 1
+
+
+def probe_webm_dimensions(fileobj: BinaryIO) -> tuple[int, int]:
+    original_position = fileobj.tell()
+    try:
+        fileobj.seek(0)
+        data = fileobj.read(min(file_size(fileobj), 8 * 1024 * 1024))
+        if data[:4] != b"\x1a\x45\xdf\xa3":
+            raise ValueError("Invalid WebM file")
+        video_cursor = 0
+        while True:
+            video_cursor = data.find(b"\xe0", video_cursor)
+            if video_cursor < 0:
+                break
+            size_info = _ebml_vint(data, video_cursor + 1)
+            if size_info:
+                size, size_length = size_info
+                payload_start = video_cursor + 1 + size_length
+                payload_end = min(len(data), payload_start + size)
+                payload = data[payload_start:payload_end]
+                width = _webm_uint_element(payload, 0xB0)
+                height = _webm_uint_element(payload, 0xBA)
+                if width and height:
+                    return _positive_dimensions(width, height)
+            video_cursor += 1
+        raise ValueError("WebM video dimensions were not found")
+    finally:
+        fileobj.seek(original_position)
+
+
+def probe_overlay_dimensions(
+    fileobj: BinaryIO, *, overlay_type: str, suffix: str
+) -> tuple[int, int]:
+    if overlay_type == "image":
+        return probe_image_dimensions(fileobj, suffix)
+    if suffix == ".mp4":
+        return probe_mp4_dimensions(fileobj)
+    if suffix == ".webm":
+        return probe_webm_dimensions(fileobj)
+    raise ValueError("Unsupported video type")
+
+
+def inspect_overlay_upload(
+    upload: UploadFile, filename: str
+) -> tuple[str, str, str, int, int, int]:
+    suffix = Path(filename).suffix.lower()
+    media_definition = OVERLAY_MEDIA_TYPES.get(suffix)
+    if not media_definition:
+        raise HTTPException(400, f"Unsupported overlay file type: {filename}")
+    overlay_type, media_type = media_definition
+    claimed_type = str(upload.content_type or "").split(";", 1)[0].strip().lower()
+    allowed_claimed_types = {media_type, "application/octet-stream"}
+    if media_type == "image/jpeg":
+        allowed_claimed_types.update({"image/jpg", "image/pjpeg"})
+    if media_type == "video/mp4":
+        allowed_claimed_types.add("application/mp4")
+    if claimed_type and claimed_type not in allowed_claimed_types:
+        raise HTTPException(400, "File extension and MIME type do not match")
+
+    upload.file.seek(0)
+    size = file_size(upload.file)
+    upload.file.seek(0)
+    if size <= 0:
+        raise HTTPException(400, f"{filename} is empty")
+    max_bytes = (
+        OVERLAY_IMAGE_MAX_BYTES if overlay_type == "image" else OVERLAY_VIDEO_MAX_BYTES
+    )
+    if size > max_bytes:
+        limit_mb = max_bytes // (1024 * 1024)
+        raise HTTPException(413, f"{filename} exceeds the {limit_mb} MB overlay limit")
+    try:
+        width, height = probe_overlay_dimensions(
+            upload.file, overlay_type=overlay_type, suffix=suffix
+        )
+    except (OSError, ValueError, struct.error) as exc:
+        raise HTTPException(400, f"{filename} is not a valid {overlay_type} file") from exc
+    upload.file.seek(0)
+    return overlay_type, media_type, suffix, size, width, height
+
+
+def page_canvas_dimensions(page: dict[str, Any]) -> tuple[int, int]:
+    if page["type"] == "image":
+        try:
+            raw = read_page_asset(page)
+            return probe_image_dimensions(
+                io.BytesIO(raw), Path(str(page["entry_path"])).suffix.lower()
+            )
+        except (FileNotFoundError, OSError, ValueError, struct.error):
+            pass
+    return (
+        int(page.get("viewport_width") or DEFAULT_VIEWPORT_WIDTH),
+        int(page.get("viewport_height") or DEFAULT_VIEWPORT_HEIGHT),
+    )
+
+
+def default_overlay_geometry(
+    page: dict[str, Any], aspect_ratio: float
+) -> dict[str, float]:
+    if not math.isfinite(aspect_ratio) or aspect_ratio <= 0:
+        raise HTTPException(400, "aspect_ratio must be positive")
+    page_width, page_height = page_canvas_dimensions(page)
+    width = OVERLAY_DEFAULT_WIDTH
+    height = width * page_width / (aspect_ratio * page_height)
+    if height > 1:
+        height = 1.0
+        width = min(1.0, height * aspect_ratio * page_height / page_width)
+    return {
+        "x": (1 - width) / 2,
+        "y": (1 - height) / 2,
+        "width": width,
+        "height": height,
+    }
+
+
+def normalize_overlay_geometry(values: dict[str, Any]) -> dict[str, float]:
+    try:
+        geometry = {
+            field: float(values[field]) for field in ("x", "y", "width", "height")
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(400, "Overlay requires x/y/width/height") from exc
+    if not all(math.isfinite(value) for value in geometry.values()):
+        raise HTTPException(400, "Overlay geometry must be finite")
+    if geometry["x"] < 0 or geometry["x"] > 1:
+        raise HTTPException(400, "x must be between 0 and 1")
+    if geometry["y"] < 0 or geometry["y"] > 1:
+        raise HTTPException(400, "y must be between 0 and 1")
+    if geometry["width"] <= 0 or geometry["width"] > 1:
+        raise HTTPException(400, "width must be greater than 0 and at most 1")
+    if geometry["height"] <= 0 or geometry["height"] > 1:
+        raise HTTPException(400, "height must be greater than 0 and at most 1")
+    if geometry["x"] + geometry["width"] > 1.000000001:
+        raise HTTPException(400, "Overlay exceeds the page's right edge")
+    if geometry["y"] + geometry["height"] > 1.000000001:
+        raise HTTPException(400, "Overlay exceeds the page's bottom edge")
+    return geometry
 
 
 def media_type_for_path(relative_path: str) -> str:
@@ -859,6 +1335,12 @@ def api_delete_project(project_id: str):
     get_project(project_id)
     with db() as conn:
         pages = [row_to_dict(r) for r in conn.execute("SELECT * FROM pages WHERE project_id = ?", (project_id,)).fetchall()]
+        overlays = [
+            row_to_dict(row)
+            for row in conn.execute(
+                "SELECT * FROM overlays WHERE project_id = ?", (project_id,)
+            ).fetchall()
+        ]
         asset_paths = {
             page["id"]: [
                 str(row["relative_path"])
@@ -872,6 +1354,8 @@ def api_delete_project(project_id: str):
         conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
     for page in pages:
         delete_asset_package(page, asset_paths[page["id"]])
+    for overlay in overlays:
+        delete_overlay_asset(overlay, suppress_errors=True)
     return {"ok": True}
 
 
@@ -885,6 +1369,14 @@ def api_project(project_id: str):
         interactions = conn.execute(
             "SELECT * FROM interactions WHERE project_id = ? ORDER BY created_at", (project_id,)
         ).fetchall()
+        overlays = conn.execute(
+            """
+            SELECT * FROM overlays
+            WHERE project_id = ?
+            ORDER BY page_id, z_index, created_at
+            """,
+            (project_id,),
+        ).fetchall()
     project["pages"] = [
         page_to_api(ensure_html_instrumentation(row_to_dict(row))) for row in pages
     ]
@@ -894,6 +1386,7 @@ def api_project(project_id: str):
         item["payload"] = json.loads(item.pop("payload_json"))
         parsed.append(item)
     project["interactions"] = parsed
+    project["overlays"] = [overlay_to_api(row_to_dict(row)) for row in overlays]
     return project
 
 
@@ -1074,8 +1567,16 @@ def api_delete_page(page_id: str):
     page = get_page(page_id)
     paths = page_asset_paths(page_id)
     with db() as conn:
+        overlays = [
+            row_to_dict(row)
+            for row in conn.execute(
+                "SELECT * FROM overlays WHERE page_id = ?", (page_id,)
+            ).fetchall()
+        ]
         conn.execute("DELETE FROM pages WHERE id = ?", (page_id,))
     delete_asset_package(page, paths)
+    for overlay in overlays:
+        delete_overlay_asset(overlay, suppress_errors=True)
     return {"ok": True}
 
 
@@ -1085,6 +1586,157 @@ def api_page_content_url(page_id: str):
     return {
         "content_url": page["content_url"],
         "content_url_expires_at": page["content_url_expires_at"],
+    }
+
+
+@app.post("/api/pages/{page_id}/overlays")
+async def api_create_overlay(
+    page_id: str,
+    file: UploadFile = File(...),
+    storage_backend: str | None = Form(None),
+):
+    page = get_page(page_id)
+    if page["type"] not in {"image", "html"}:
+        raise HTTPException(400, "Overlays are only supported on image or HTML pages")
+
+    backend = str(storage_backend or page["storage_backend"]).strip().lower()
+    if backend not in {"local", "s3"}:
+        raise HTTPException(400, "storage_backend must be local or s3")
+    if backend == "s3" and not s3_configured():
+        raise HTTPException(400, "S3 is not configured on the server")
+
+    filename = safe_filename(file.filename or "overlay")
+    overlay_type, media_type, suffix, size, media_width, media_height = (
+        await run_in_threadpool(inspect_overlay_upload, file, filename)
+    )
+    aspect_ratio = media_width / media_height
+    geometry = await run_in_threadpool(default_overlay_geometry, page, aspect_ratio)
+    geometry = normalize_overlay_geometry(geometry)
+    overlay_id = str(uuid.uuid4())
+    key = overlay_storage_key(page["project_id"], overlay_id, suffix, backend)
+    overlay_stub = {"storage_backend": backend, "storage_key": key}
+
+    created_at = now_iso()
+    try:
+        await run_in_threadpool(
+            store_asset_stream,
+            backend=backend,
+            key=key,
+            fileobj=file.file,
+            size=size,
+            media_type=media_type,
+        )
+        with db() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(MAX(z_index), -1) AS z_index
+                FROM overlays WHERE page_id = ?
+                """,
+                (page_id,),
+            ).fetchone()
+            z_index = min(int(row["z_index"]) + 1, OVERLAY_MAX_Z_INDEX)
+            conn.execute(
+                """
+                INSERT INTO overlays(
+                    id, project_id, page_id, type, storage_backend, storage_key,
+                    media_type, size_bytes, x, y, width, height, aspect_ratio,
+                    object_fit, z_index, video_controls, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'cover', ?, 1, ?, ?)
+                """,
+                (
+                    overlay_id,
+                    page["project_id"],
+                    page_id,
+                    overlay_type,
+                    backend,
+                    key,
+                    media_type,
+                    size,
+                    geometry["x"],
+                    geometry["y"],
+                    geometry["width"],
+                    geometry["height"],
+                    aspect_ratio,
+                    z_index,
+                    created_at,
+                    created_at,
+                ),
+            )
+    except Exception:
+        delete_overlay_asset(overlay_stub, suppress_errors=True)
+        raise
+    return overlay_to_api(get_overlay(overlay_id))
+
+
+@app.patch("/api/overlays/{overlay_id}")
+def api_update_overlay(overlay_id: str, payload: OverlayUpdate):
+    overlay = get_overlay(overlay_id)
+    values = payload.model_dump(exclude_unset=True)
+    if not values:
+        raise HTTPException(400, "No overlay fields to update")
+    if any(value is None for value in values.values()):
+        raise HTTPException(400, "Overlay fields cannot be null")
+
+    updates: dict[str, Any] = {}
+    geometry_fields = {"x", "y", "width", "height"}
+    if geometry_fields.intersection(values):
+        merged = {
+            field: values.get(field, overlay[field]) for field in geometry_fields
+        }
+        normalized = normalize_overlay_geometry(merged)
+        for field in geometry_fields.intersection(values):
+            updates[field] = normalized[field]
+
+    if "object_fit" in values:
+        object_fit = str(values["object_fit"]).strip().lower()
+        if object_fit not in {"contain", "cover"}:
+            raise HTTPException(400, "object_fit must be contain or cover")
+        updates["object_fit"] = object_fit
+    if "z_index" in values:
+        z_index = values["z_index"]
+        if isinstance(z_index, bool) or not 0 <= int(z_index) <= OVERLAY_MAX_Z_INDEX:
+            raise HTTPException(
+                400, f"z_index must be between 0 and {OVERLAY_MAX_Z_INDEX}"
+            )
+        updates["z_index"] = int(z_index)
+    if "video_controls" in values:
+        updates["video_controls"] = int(bool(values["video_controls"]))
+
+    if not updates:
+        raise HTTPException(400, "No overlay fields to update")
+    updates["updated_at"] = now_iso()
+    assignments = ", ".join(f"{field} = ?" for field in updates)
+    try:
+        with db() as conn:
+            conn.execute(
+                f"UPDATE overlays SET {assignments} WHERE id = ?",
+                (*updates.values(), overlay_id),
+            )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(409, "Overlay configuration conflicts with its page") from exc
+    return overlay_to_api(get_overlay(overlay_id))
+
+
+@app.delete("/api/overlays/{overlay_id}")
+def api_delete_overlay(overlay_id: str):
+    overlay = get_overlay(overlay_id)
+    try:
+        delete_overlay_asset(overlay)
+    except ObjectStorageConfigurationError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, "Failed to delete overlay asset") from exc
+    with db() as conn:
+        conn.execute("DELETE FROM overlays WHERE id = ?", (overlay_id,))
+    return {"ok": True}
+
+
+@app.get("/api/overlays/{overlay_id}/content-url")
+def api_overlay_content_url(overlay_id: str):
+    overlay = overlay_to_api(get_overlay(overlay_id))
+    return {
+        "content_url": overlay["content_url"],
+        "content_url_expires_at": overlay["content_url_expires_at"],
     }
 
 
@@ -1152,6 +1804,84 @@ def parse_range_header(value: str | None, size: int) -> tuple[int, int] | None:
             headers={"Content-Range": f"bytes */{size}"},
         )
     return start, end
+
+
+@app.api_route(
+    "/overlay-content/{overlay_id}/{token}/{asset_name}",
+    methods=["GET", "HEAD", "OPTIONS"],
+)
+def overlay_asset_content(
+    request: Request,
+    overlay_id: str,
+    token: str,
+    asset_name: str,
+):
+    if not valid_content_token(f"overlay:{overlay_id}", token):
+        raise HTTPException(403, "Content URL is invalid or expired")
+    if request.method == "OPTIONS":
+        headers = content_headers()
+        headers.update(
+            {
+                "Access-Control-Allow-Headers": "Range",
+                "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            }
+        )
+        return Response(status_code=204, headers=headers)
+
+    overlay = get_overlay(overlay_id)
+    key = str(overlay["storage_key"])
+    if asset_name != Path(key).name:
+        raise HTTPException(404, "Overlay asset not found")
+    size = int(overlay["size_bytes"])
+    media_type = str(overlay["media_type"])
+    headers = content_headers()
+    byte_range = parse_range_header(request.headers.get("range"), size)
+
+    if overlay["storage_backend"] == "local":
+        path = local_asset_path(key)
+        if not path.is_file():
+            raise HTTPException(404, "Overlay asset not found")
+        return FileResponse(path, media_type=media_type, headers=headers)
+
+    if overlay["storage_backend"] != "s3":
+        raise HTTPException(500, "Unsupported storage backend")
+
+    settings = object_storage_settings()
+    if request.method == "GET" and settings.direct_read:
+        try:
+            signed = object_storage().presign_get(key)
+        except ObjectStorageConfigurationError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                502, "Failed to create an object storage access URL"
+            ) from exc
+        return RedirectResponse(signed.url, status_code=307, headers=headers)
+
+    if byte_range:
+        start, end = byte_range
+        status_code = 206
+        content_length = end - start + 1
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    else:
+        start = end = None
+        status_code = 200
+        content_length = size
+    headers["Content-Length"] = str(content_length)
+    if request.method == "HEAD":
+        return Response(status_code=status_code, media_type=media_type, headers=headers)
+    try:
+        stream = object_storage().iter_bytes(key, start=start, end=end)
+    except ObjectStorageConfigurationError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, "Failed to read overlay asset") from exc
+    return StreamingResponse(
+        stream,
+        status_code=status_code,
+        media_type=media_type,
+        headers=headers,
+    )
 
 
 @app.api_route(

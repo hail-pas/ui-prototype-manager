@@ -30,8 +30,17 @@ const uploadStatusTitle = document.getElementById('uploadStatusTitle');
 const uploadStatusDetail = document.getElementById('uploadStatusDetail');
 const renderSettingsSection = document.getElementById('renderSettingsSection');
 const renderSettingsPanel = document.getElementById('renderSettingsPanel');
+const overlayElementsSection = document.getElementById('overlayElementsSection');
+const overlayImageInput = document.getElementById('overlayImageInput');
+const overlayVideoInput = document.getElementById('overlayVideoInput');
+const overlayCount = document.getElementById('overlayCount');
+const overlayList = document.getElementById('overlayList');
+const overlaySelectionPanel = document.getElementById('overlaySelectionPanel');
+const overlayUploadStatus = document.getElementById('overlayUploadStatus');
+const overlayUploadTitle = document.getElementById('overlayUploadTitle');
+const overlayUploadDetail = document.getElementById('overlayUploadDetail');
 
-let state = {pages: [], interactions: []};
+let state = {pages: [], interactions: [], overlays: []};
 let config = {
   storage_backends: ['local'],
   s3: {configured: false},
@@ -43,6 +52,12 @@ let hoveredInteractionId = null;
 let missingElementIds = new Set();
 let htmlElementMeta = new Map();
 let drawing = null;
+let selectedOverlayId = null;
+let hoveredOverlayId = null;
+let overlayGesture = null;
+let overlayUploadInProgress = false;
+let overlayUploadStartedAt = 0;
+let overlayUploadTimer = null;
 let renameTarget = null;
 let pendingFiles = [];
 let frameController = null;
@@ -68,6 +83,16 @@ function currentPage() {
 
 function currentInteractions() {
   return state.interactions.filter((interaction) => interaction.source_page_id === currentPageId);
+}
+
+function currentOverlays() {
+  return state.overlays
+    .filter((overlay) => overlay.page_id === currentPageId)
+    .sort((left, right) => left.z_index - right.z_index || left.created_at.localeCompare(right.created_at));
+}
+
+function overlayById(overlayId) {
+  return state.overlays.find((overlay) => overlay.id === overlayId);
 }
 
 function interactionById(interactionId) {
@@ -214,10 +239,13 @@ async function loadConfig() {
 
 async function reload(keepCurrent = true) {
   state = await api(`/api/projects/${projectId}`);
+  state.overlays = Array.isArray(state.overlays) ? state.overlays : [];
   if (!keepCurrent || !state.pages.some((page) => page.id === currentPageId)) {
     currentPageId = state.pages[0]?.id || null;
   }
   selection = null;
+  selectedOverlayId = null;
+  hoveredOverlayId = null;
   hoveredInteractionId = null;
   missingElementIds = new Set();
   htmlElementMeta = new Map();
@@ -227,6 +255,7 @@ async function reload(keepCurrent = true) {
 function renderAll() {
   renderPageList();
   renderCanvas();
+  renderOverlayElements();
   renderRenderSettings();
   renderInteractions();
   renderSelection();
@@ -255,6 +284,8 @@ function renderPageList() {
       if (!confirmDiscardSelection()) return;
       currentPageId = row.dataset.id;
       selection = null;
+      selectedOverlayId = null;
+      hoveredOverlayId = null;
       hoveredInteractionId = null;
       missingElementIds = new Set();
       htmlElementMeta = new Map();
@@ -326,6 +357,7 @@ async function renderCanvas() {
       viewportWidth: page.viewport_width || 1920,
       viewportHeight: page.viewport_height || 1080,
     });
+    renderHtmlPageOverlays();
     frameController.iframe.addEventListener('load', () => postHtmlEditorState(), {once: true});
     return;
   }
@@ -334,7 +366,10 @@ async function renderCanvas() {
   canvasArea.innerHTML = `
     <div id="imageStage" class="image-stage">
       <img id="pageImage" src="${esc(pageContentUrl(page))}" alt="${esc(page.name)}">
+      <div id="imageOverlayLayer" class="overlay-layer"></div>
+      <div id="imageGuideLayer" class="editor-guide-layer"></div>
     </div>`;
+  renderImagePageOverlays();
   const image = document.getElementById('pageImage');
   image.addEventListener('error', async () => {
     if (image.dataset.contentUrlRetried === 'true') return;
@@ -349,6 +384,552 @@ async function renderCanvas() {
   if (image.complete && image.naturalWidth > 0) initImageStage();
   else image.addEventListener('load', initImageStage, {once: true});
 }
+
+function overlayContentUrl(overlay) {
+  return new URL(overlay.content_url || `/api/overlays/${overlay.id}/content-url`, location.href).href;
+}
+
+async function refreshOverlayContentUrl(overlay) {
+  const refreshKey = `overlay:${overlay.id}`;
+  if (!contentUrlRefreshes.has(refreshKey)) {
+    const refresh = api(`/api/overlays/${overlay.id}/content-url`)
+      .then((data) => Object.assign(overlay, data))
+      .finally(() => contentUrlRefreshes.delete(refreshKey));
+    contentUrlRefreshes.set(refreshKey, refresh);
+  }
+  await contentUrlRefreshes.get(refreshKey);
+}
+
+function applyOverlayGeometry(element, overlay) {
+  Object.assign(element.style, {
+    left: `${overlay.x * 100}%`,
+    top: `${overlay.y * 100}%`,
+    width: `${overlay.width * 100}%`,
+    height: `${overlay.height * 100}%`,
+  });
+}
+
+async function retryOverlayMedia(media, overlay) {
+  if (media.dataset.contentUrlRetried === 'true') return;
+  media.dataset.contentUrlRetried = 'true';
+  try {
+    await refreshOverlayContentUrl(overlay);
+    if (overlay.page_id === currentPageId && media.isConnected) media.src = overlayContentUrl(overlay);
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+function createEditorOverlayElement(overlay) {
+  const element = document.createElement('div');
+  const selected = selectedOverlayId === overlay.id;
+  const hovered = hoveredOverlayId === overlay.id;
+  const displayName = overlayDisplayName(overlay);
+  element.className = `editor-overlay ${selected ? 'is-selected' : ''} ${hovered ? 'is-hovered' : ''}`;
+  element.dataset.id = overlay.id;
+  element.tabIndex = 0;
+  element.setAttribute('role', 'button');
+  element.setAttribute('aria-label', `选择媒体：${displayName}`);
+  element.setAttribute('aria-pressed', String(selected));
+  element.style.zIndex = selected ? '40' : hovered ? '35' : '30';
+  applyOverlayGeometry(element, overlay);
+
+  const media = document.createElement(overlay.type === 'video' ? 'video' : 'img');
+  media.className = 'editor-overlay-media';
+  media.draggable = false;
+  media.style.objectFit = overlay.object_fit;
+  if (overlay.type === 'video') {
+    media.controls = false;
+    media.playsInline = true;
+    media.preload = 'metadata';
+  } else {
+    media.alt = '';
+  }
+  media.src = overlayContentUrl(overlay);
+  media.addEventListener('error', () => retryOverlayMedia(media, overlay));
+  element.appendChild(media);
+
+  const label = document.createElement('span');
+  label.className = 'editor-overlay-label';
+  label.textContent = displayName;
+  element.appendChild(label);
+
+  const handle = document.createElement('span');
+  handle.className = 'editor-overlay-handle';
+  handle.setAttribute('aria-hidden', 'true');
+  handle.addEventListener('pointerdown', (event) => startOverlayGesture(event, overlay.id, 'resize'));
+  element.appendChild(handle);
+
+  element.addEventListener('pointerdown', (event) => startOverlayGesture(event, overlay.id, 'drag'));
+  element.addEventListener('pointerenter', () => setHoveredOverlay(overlay.id));
+  element.addEventListener('pointerleave', () => setHoveredOverlay(null));
+  element.addEventListener('focus', () => setHoveredOverlay(overlay.id));
+  element.addEventListener('blur', () => setHoveredOverlay(null));
+  element.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      selectOverlay(overlay.id, {source: 'canvas'});
+    }
+  });
+  return element;
+}
+
+function renderEditorOverlays(layer) {
+  if (!layer) return;
+  layer.replaceChildren(...currentOverlays().map(createEditorOverlayElement));
+}
+
+function renderImagePageOverlays() {
+  renderEditorOverlays(document.getElementById('imageOverlayLayer'));
+}
+
+function renderHtmlPageOverlays() {
+  const viewport = frameController?.viewport;
+  if (!viewport) return;
+  const layer = document.createElement('div');
+  layer.className = 'overlay-layer';
+  layer.id = 'htmlOverlayLayer';
+  viewport.appendChild(layer);
+  const guides = document.createElement('div');
+  guides.className = 'editor-guide-layer';
+  guides.id = 'htmlGuideLayer';
+  viewport.appendChild(guides);
+  renderEditorOverlays(layer);
+}
+
+function currentOverlayLayer() {
+  return currentPage()?.type === 'html'
+    ? document.getElementById('htmlOverlayLayer')
+    : document.getElementById('imageOverlayLayer');
+}
+
+function currentGuideLayer() {
+  return currentPage()?.type === 'html'
+    ? document.getElementById('htmlGuideLayer')
+    : document.getElementById('imageGuideLayer');
+}
+
+function rerenderEditorOverlays() {
+  renderEditorOverlays(currentOverlayLayer());
+}
+
+function applyOverlaySelectionState() {
+  currentOverlayLayer()?.querySelectorAll('.editor-overlay').forEach((element) => {
+    const selected = element.dataset.id === selectedOverlayId;
+    const hovered = element.dataset.id === hoveredOverlayId;
+    element.classList.toggle('is-selected', selected);
+    element.classList.toggle('is-hovered', hovered);
+    element.setAttribute('aria-pressed', String(selected));
+    element.style.zIndex = selected ? '40' : hovered ? '35' : '30';
+  });
+  overlayList.querySelectorAll('.overlay-list-item').forEach((row) => {
+    row.classList.toggle('is-hovered', row.dataset.id === hoveredOverlayId);
+  });
+}
+
+function setHoveredOverlay(overlayId) {
+  if (hoveredOverlayId === overlayId) return;
+  hoveredOverlayId = overlayId;
+  applyOverlaySelectionState();
+}
+
+function scrollOverlayListItemIntoView(overlayId) {
+  requestAnimationFrame(() => {
+    overlayList.querySelector(`.overlay-list-item[data-id="${overlayId}"]`)
+      ?.scrollIntoView({block: 'nearest'});
+  });
+}
+
+function scrollEditorOverlayIntoView(overlayId) {
+  requestAnimationFrame(() => {
+    currentOverlayLayer()?.querySelector(`.editor-overlay[data-id="${overlayId}"]`)
+      ?.scrollIntoView({behavior: 'smooth', block: 'center', inline: 'center'});
+  });
+}
+
+function selectOverlay(overlayId, {source = 'canvas'} = {}) {
+  const overlay = overlayById(overlayId);
+  if (!overlay || overlay.page_id !== currentPageId) return false;
+  if (selectedOverlayId === overlayId) {
+    if (source === 'list') scrollEditorOverlayIntoView(overlayId);
+    return true;
+  }
+  if (!confirmDiscardSelection()) return false;
+  selection = null;
+  hoveredInteractionId = null;
+  selectedOverlayId = overlayId;
+  renderSelection();
+  renderInteractions();
+  renderOverlayElements();
+  applyOverlaySelectionState();
+  refreshCanvasAnnotations({rerenderImage: true});
+  if (source === 'list') scrollEditorOverlayIntoView(overlayId);
+  else scrollOverlayListItemIntoView(overlayId);
+  return true;
+}
+
+function clearOverlaySelection() {
+  if (!selectedOverlayId) return;
+  selectedOverlayId = null;
+  renderOverlayElements();
+  applyOverlaySelectionState();
+}
+
+function snapAxis(position, size, threshold) {
+  const candidates = [
+    {position: 0, guide: 0},
+    {position: 0.5 - size / 2, guide: 0.5},
+    {position: 1 - size, guide: 1},
+  ];
+  let match = null;
+  candidates.forEach((candidate) => {
+    const distance = Math.abs(candidate.position - position);
+    if (distance <= threshold && (!match || distance < match.distance)) {
+      match = {...candidate, distance};
+    }
+  });
+  return match || {position, guide: null};
+}
+
+function showSnapGuides(vertical, horizontal) {
+  const layer = currentGuideLayer();
+  if (!layer) return;
+  const guides = [];
+  if (vertical !== null) {
+    const guide = document.createElement('span');
+    guide.className = 'editor-guide is-vertical';
+    guide.style.left = vertical === 1 ? 'calc(100% - 1px)' : `${vertical * 100}%`;
+    guides.push(guide);
+  }
+  if (horizontal !== null) {
+    const guide = document.createElement('span');
+    guide.className = 'editor-guide is-horizontal';
+    guide.style.top = horizontal === 1 ? 'calc(100% - 1px)' : `${horizontal * 100}%`;
+    guides.push(guide);
+  }
+  layer.replaceChildren(...guides);
+}
+
+function clearSnapGuides() {
+  currentGuideLayer()?.replaceChildren();
+}
+
+const savingOverlayIds = new Set();
+
+function startOverlayGesture(event, overlayId, mode) {
+  if (event.button !== 0 || overlayGesture || savingOverlayIds.has(overlayId)) return;
+  if (mode === 'resize') event.stopPropagation();
+  const overlay = overlayById(overlayId);
+  if (!overlay || !selectOverlay(overlayId)) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const element = event.target.closest('.editor-overlay');
+  const layer = currentOverlayLayer();
+  const rect = layer?.getBoundingClientRect();
+  if (!element || !rect || rect.width <= 0 || rect.height <= 0) return;
+  const captureElement = event.currentTarget;
+  const original = {
+    x: overlay.x,
+    y: overlay.y,
+    width: overlay.width,
+    height: overlay.height,
+  };
+  overlayGesture = {
+    mode,
+    overlay,
+    element,
+    captureElement,
+    pointerId: event.pointerId,
+    rect,
+    original,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    moved: false,
+  };
+  captureElement.setPointerCapture(event.pointerId);
+  captureElement.addEventListener('pointermove', moveOverlayGesture);
+  captureElement.addEventListener('pointerup', finishOverlayGesture);
+  captureElement.addEventListener('pointercancel', cancelOverlayGesture);
+}
+
+function moveOverlayGesture(event) {
+  const gesture = overlayGesture;
+  if (!gesture || event.pointerId !== gesture.pointerId) return;
+  event.preventDefault();
+  const deltaX = event.clientX - gesture.startClientX;
+  const deltaY = event.clientY - gesture.startClientY;
+  const {overlay, original, rect} = gesture;
+
+  if (gesture.mode === 'drag') {
+    let x = Math.max(0, Math.min(1 - original.width, original.x + deltaX / rect.width));
+    let y = Math.max(0, Math.min(1 - original.height, original.y + deltaY / rect.height));
+    const snappedX = snapAxis(x, original.width, 6 / rect.width);
+    const snappedY = snapAxis(y, original.height, 6 / rect.height);
+    x = snappedX.position;
+    y = snappedY.position;
+    Object.assign(overlay, {x, y});
+    showSnapGuides(snappedX.guide, snappedY.guide);
+  } else {
+    const aspectRatio = Number(overlay.aspect_ratio) > 0
+      ? Number(overlay.aspect_ratio)
+      : (original.width * rect.width) / (original.height * rect.height);
+    const minimumWidth = Math.min(40, (1 - original.x) * rect.width);
+    const maximumWidth = Math.min(
+      (1 - original.x) * rect.width,
+      (1 - original.y) * rect.height * aspectRatio,
+    );
+    const pixelWidth = Math.min(maximumWidth, Math.max(minimumWidth, original.width * rect.width + deltaX));
+    Object.assign(overlay, {
+      width: pixelWidth / rect.width,
+      height: (pixelWidth / aspectRatio) / rect.height,
+    });
+  }
+  gesture.moved = gesture.moved || Math.abs(deltaX) >= 1 || Math.abs(deltaY) >= 1;
+  applyOverlayGeometry(gesture.element, overlay);
+}
+
+function cleanupOverlayGesture() {
+  const gesture = overlayGesture;
+  if (!gesture) return null;
+  const {captureElement, pointerId} = gesture;
+  captureElement.removeEventListener('pointermove', moveOverlayGesture);
+  captureElement.removeEventListener('pointerup', finishOverlayGesture);
+  captureElement.removeEventListener('pointercancel', cancelOverlayGesture);
+  if (captureElement.hasPointerCapture(pointerId)) captureElement.releasePointerCapture(pointerId);
+  overlayGesture = null;
+  clearSnapGuides();
+  return gesture;
+}
+
+function cancelOverlayGesture() {
+  const gesture = cleanupOverlayGesture();
+  if (!gesture) return;
+  Object.assign(gesture.overlay, gesture.original);
+  applyOverlayGeometry(gesture.element, gesture.overlay);
+}
+
+function finishOverlayGesture() {
+  const gesture = cleanupOverlayGesture();
+  if (!gesture || !gesture.moved) return;
+  void saveOverlayGeometry(gesture.overlay, gesture.original, gesture.element);
+}
+
+function roundedOverlayGeometry(overlay) {
+  return Object.fromEntries(
+    ['x', 'y', 'width', 'height'].map((field) => [field, Number(overlay[field].toFixed(8))]),
+  );
+}
+
+async function saveOverlayGeometry(overlay, original, element) {
+  savingOverlayIds.add(overlay.id);
+  try {
+    const saved = await api(`/api/overlays/${overlay.id}`, {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(roundedOverlayGeometry(overlay)),
+    });
+    const index = state.overlays.findIndex((item) => item.id === saved.id);
+    if (index >= 0) state.overlays[index] = saved;
+  } catch (error) {
+    Object.assign(overlay, original);
+    if (element.isConnected) applyOverlayGeometry(element, overlay);
+    alert(error.message);
+  } finally {
+    savingOverlayIds.delete(overlay.id);
+    if (overlay.page_id === currentPageId) {
+      renderOverlayElements();
+      rerenderEditorOverlays();
+    }
+  }
+}
+
+function overlayDisplayName(overlay, items = currentOverlays()) {
+  const sameType = items.filter((item) => item.type === overlay.type);
+  const index = sameType.findIndex((item) => item.id === overlay.id) + 1;
+  return `${overlay.type === 'video' ? '视频' : '图片'} ${Math.max(1, index)}`;
+}
+
+function renderOverlayElements() {
+  const page = currentPage();
+  overlayElementsSection.hidden = !page;
+  if (!page) {
+    overlayCount.textContent = '0';
+    overlayList.innerHTML = '';
+    overlaySelectionPanel.hidden = true;
+    return;
+  }
+
+  const items = currentOverlays();
+  if (selectedOverlayId && !items.some((item) => item.id === selectedOverlayId)) {
+    selectedOverlayId = null;
+  }
+  if (hoveredOverlayId && !items.some((item) => item.id === hoveredOverlayId)) {
+    hoveredOverlayId = null;
+  }
+  overlayCount.textContent = items.length;
+  if (!items.length) {
+    overlayList.innerHTML = '<div class="overlay-list-empty">当前页面还没有媒体</div>';
+  } else {
+    overlayList.innerHTML = items.map((overlay) => {
+      const name = overlayDisplayName(overlay, items);
+      const active = overlay.id === selectedOverlayId;
+      const hovered = overlay.id === hoveredOverlayId;
+      return `
+        <div class="overlay-list-item ${active ? 'is-active' : ''} ${hovered ? 'is-hovered' : ''}" data-id="${overlay.id}">
+          <button class="overlay-list-select" type="button" aria-pressed="${active}">
+            <span class="overlay-list-icon">${overlay.type === 'video' ? 'VID' : 'IMG'}</span>
+            <span class="overlay-list-name">${name}</span>
+          </button>
+          <button class="mini-danger delete-overlay" type="button" title="删除" aria-label="删除 ${name}">✕</button>
+        </div>`;
+    }).join('');
+    overlayList.querySelectorAll('.overlay-list-item').forEach((row) => {
+      const selectButton = row.querySelector('.overlay-list-select');
+      const deleteButton = row.querySelector('.delete-overlay');
+      row.addEventListener('pointerenter', () => setHoveredOverlay(row.dataset.id));
+      row.addEventListener('pointerleave', () => setHoveredOverlay(null));
+      selectButton.addEventListener('click', () => selectOverlay(row.dataset.id, {source: 'list'}));
+      selectButton.addEventListener('focus', () => setHoveredOverlay(row.dataset.id));
+      selectButton.addEventListener('blur', () => setHoveredOverlay(null));
+      deleteButton.addEventListener('focus', () => setHoveredOverlay(row.dataset.id));
+      deleteButton.addEventListener('blur', () => setHoveredOverlay(null));
+      deleteButton.addEventListener('click', () => deleteOverlay(row.dataset.id));
+    });
+  }
+
+  const selected = overlayById(selectedOverlayId);
+  if (!selected || selected.page_id !== currentPageId) {
+    overlaySelectionPanel.hidden = true;
+    overlaySelectionPanel.innerHTML = '';
+    return;
+  }
+  overlaySelectionPanel.hidden = false;
+  overlaySelectionPanel.innerHTML = `
+    <div class="overlay-selection-meta">
+      <span>${overlayDisplayName(selected, items)}</span>
+      <span>${selected.type === 'video' ? '视频' : '图片'} · ${storageLabel(selected)}</span>
+    </div>
+    <label for="overlayObjectFit">填充方式</label>
+    <select id="overlayObjectFit">
+      <option value="cover" ${selected.object_fit === 'cover' ? 'selected' : ''}>裁切填充</option>
+      <option value="contain" ${selected.object_fit === 'contain' ? 'selected' : ''}>完整显示</option>
+    </select>
+    ${selected.type === 'video' ? `
+      <label class="overlay-controls-check">
+        <input id="overlayVideoControls" type="checkbox" ${selected.video_controls ? 'checked' : ''}>
+        <span>预览显示播放控件</span>
+      </label>` : ''}
+    <button id="deleteSelectedOverlay" class="danger-btn overlay-delete-btn" type="button">删除媒体</button>`;
+
+  document.getElementById('overlayObjectFit').addEventListener('change', (event) => {
+    void updateOverlayProperties(selected.id, {object_fit: event.target.value});
+  });
+  document.getElementById('overlayVideoControls')?.addEventListener('change', (event) => {
+    void updateOverlayProperties(selected.id, {video_controls: event.target.checked});
+  });
+  document.getElementById('deleteSelectedOverlay').addEventListener('click', () => deleteOverlay(selected.id));
+}
+
+async function updateOverlayProperties(overlayId, updates) {
+  const overlay = overlayById(overlayId);
+  if (!overlay || savingOverlayIds.has(overlayId)) return;
+  savingOverlayIds.add(overlayId);
+  try {
+    const saved = await api(`/api/overlays/${overlayId}`, {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(updates),
+    });
+    const index = state.overlays.findIndex((item) => item.id === saved.id);
+    if (index >= 0) state.overlays[index] = saved;
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    savingOverlayIds.delete(overlayId);
+    if (overlay.page_id === currentPageId) {
+      renderOverlayElements();
+      rerenderEditorOverlays();
+    }
+  }
+}
+
+async function deleteOverlay(overlayId) {
+  const overlay = overlayById(overlayId);
+  if (!overlay || savingOverlayIds.has(overlayId)) return;
+  const name = overlayDisplayName(overlay);
+  if (!window.confirm(`删除${name}？底层媒体资源也会同步删除。`)) return;
+  savingOverlayIds.add(overlayId);
+  try {
+    await api(`/api/overlays/${overlayId}`, {method: 'DELETE'});
+    state.overlays = state.overlays.filter((item) => item.id !== overlayId);
+    if (selectedOverlayId === overlayId) selectedOverlayId = null;
+    if (hoveredOverlayId === overlayId) hoveredOverlayId = null;
+    renderOverlayElements();
+    rerenderEditorOverlays();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    savingOverlayIds.delete(overlayId);
+  }
+}
+
+function updateOverlayUploadStatus(file) {
+  const elapsed = Math.max(0, Math.floor((Date.now() - overlayUploadStartedAt) / 1000));
+  overlayUploadDetail.textContent = `${file.name} · 已耗时 ${elapsed} 秒`;
+}
+
+function setOverlayUploadInProgress(inProgress, file = null) {
+  overlayUploadInProgress = inProgress;
+  overlayElementsSection.classList.toggle('is-uploading', inProgress);
+  overlayImageInput.disabled = inProgress;
+  overlayVideoInput.disabled = inProgress;
+  overlayUploadStatus.hidden = !inProgress;
+  if (overlayUploadTimer) {
+    clearInterval(overlayUploadTimer);
+    overlayUploadTimer = null;
+  }
+  if (!inProgress || !file) return;
+
+  overlayUploadStartedAt = Date.now();
+  const isVideo = file.type.startsWith('video/') || /\.(mp4|webm)$/i.test(file.name);
+  overlayUploadTitle.textContent = `正在上传并处理${isVideo ? '视频' : '图片'}…`;
+  updateOverlayUploadStatus(file);
+  overlayUploadTimer = setInterval(() => updateOverlayUploadStatus(file), 1000);
+}
+
+async function uploadOverlay(input) {
+  const file = input.files?.[0];
+  input.value = '';
+  const page = currentPage();
+  if (!file || !page || overlayUploadInProgress) return;
+  if (!confirmDiscardSelection()) return;
+  selection = null;
+  selectedOverlayId = null;
+  hoveredOverlayId = null;
+  hoveredInteractionId = null;
+  renderSelection();
+  renderInteractions();
+  refreshCanvasAnnotations({rerenderImage: true});
+
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('storage_backend', storageSelect.value || page.storage_backend || 'local');
+  setOverlayUploadInProgress(true, file);
+  try {
+    const saved = await api(`/api/pages/${page.id}/overlays`, {method: 'POST', body: formData});
+    state.overlays.push(saved);
+    selectedOverlayId = saved.id;
+    renderOverlayElements();
+    rerenderEditorOverlays();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    setOverlayUploadInProgress(false);
+  }
+}
+
+overlayImageInput.addEventListener('change', () => void uploadOverlay(overlayImageInput));
+overlayVideoInput.addEventListener('change', () => void uploadOverlay(overlayVideoInput));
 
 function renderRenderSettings() {
   const page = currentPage();
@@ -482,6 +1063,10 @@ function applyImageHotspotState() {
 function startDraw(event) {
   if (event.button !== 0 || event.target.closest('.hotspot')) return;
   if (!confirmDiscardSelection()) return;
+  selectedOverlayId = null;
+  hoveredOverlayId = null;
+  renderOverlayElements();
+  applyOverlaySelectionState();
   const stage = event.currentTarget;
   const rect = stage.getBoundingClientRect();
   const startX = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
@@ -621,10 +1206,14 @@ function selectInteraction(interactionId, {label = '', source = 'list'} = {}) {
     return;
   }
   if (!confirmDiscardSelection()) return;
+  selectedOverlayId = null;
+  hoveredOverlayId = null;
   selection = selectionForInteraction(interaction, label);
   hoveredInteractionId = null;
   renderSelection();
   renderInteractions();
+  renderOverlayElements();
+  applyOverlaySelectionState();
   refreshCanvasAnnotations({
     revealInteractionId: source === 'list' && interaction.kind === 'element' ? interactionId : null,
     rerenderImage: interaction.kind === 'region',
@@ -635,6 +1224,8 @@ function selectInteraction(interactionId, {label = '', source = 'list'} = {}) {
 
 function createElementSelection(data) {
   if (!confirmDiscardSelection()) return;
+  selectedOverlayId = null;
+  hoveredOverlayId = null;
   selection = {
     isNew: true,
     interactionId: null,
@@ -649,6 +1240,8 @@ function createElementSelection(data) {
   hoveredInteractionId = null;
   renderSelection();
   renderInteractions();
+  renderOverlayElements();
+  applyOverlaySelectionState();
   postHtmlEditorState();
 }
 
@@ -1038,8 +1631,13 @@ function askDeletePage(pageId) {
 }
 
 document.addEventListener('keydown', (event) => {
-  if (event.key !== 'Escape' || !selection || document.querySelector('dialog[open]')) return;
-  clearSelection();
+  if (event.key !== 'Escape' || document.querySelector('dialog[open]')) return;
+  if (overlayGesture) {
+    cancelOverlayGesture();
+    return;
+  }
+  if (selection) clearSelection();
+  else clearOverlaySelection();
 });
 
 (async () => {
