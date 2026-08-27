@@ -2,16 +2,20 @@ const root = document.getElementById('player');
 const projectId = root.dataset.projectId;
 const stage = document.getElementById('playerStage');
 const backBtn = document.getElementById('backBtn');
-const navToggle = document.getElementById('navToggle');
 const pageList = document.getElementById('playerPageList');
 const pageCount = document.getElementById('playerPageCount');
 const pageNameElement = document.getElementById('playerPageName');
+const menuLayer = document.getElementById('playerMenuLayer');
+const menuBackdrop = document.getElementById('playerMenuBackdrop');
+const menuCloseBtn = document.getElementById('menuCloseBtn');
 
 let state = {pages: [], interactions: []};
 let historyStack = [];
 let currentPageId = null;
 let frameController = null;
 let renderVersion = 0;
+let menuOpen = false;
+let previewFocusTarget = null;
 const contentUrlRefreshes = new Map();
 
 function esc(value = '') {
@@ -26,6 +30,36 @@ function page(pageId) {
 
 function interactions(pageId) {
   return state.interactions.filter((item) => item.source_page_id === pageId);
+}
+
+function focusableMenuElements() {
+  return Array.from(menuLayer.querySelectorAll('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+    .filter((element) => !element.hidden);
+}
+
+function restorePreviewFocus() {
+  requestAnimationFrame(() => {
+    const target = frameController?.iframe || previewFocusTarget || stage;
+    if (target?.isConnected) target.focus({preventScroll: true});
+    previewFocusTarget = null;
+  });
+}
+
+function setMenuOpen(open) {
+  const nextOpen = Boolean(open);
+  if (menuOpen === nextOpen) return;
+  menuOpen = nextOpen;
+  if (menuOpen) previewFocusTarget = document.activeElement;
+  root.classList.toggle('menu-open', menuOpen);
+  menuLayer.inert = !menuOpen;
+  menuLayer.setAttribute('aria-hidden', String(!menuOpen));
+  stage.inert = menuOpen;
+  if (menuOpen) requestAnimationFrame(() => menuCloseBtn.focus({preventScroll: true}));
+  else restorePreviewFocus();
+}
+
+function toggleMenu() {
+  setMenuOpen(!menuOpen);
 }
 
 async function api(url) {
@@ -131,7 +165,10 @@ function renderPageList() {
       <span class="player-page-name">${esc(item.name)}</span>
     </button>`).join('');
   pageList.querySelectorAll('.player-page-item').forEach((button) => {
-    button.addEventListener('click', () => navigate(button.dataset.id));
+    button.addEventListener('click', () => {
+      navigate(button.dataset.id);
+      setMenuOpen(false);
+    });
   });
 }
 
@@ -143,7 +180,8 @@ async function render() {
   }
   backBtn.disabled = historyStack.length <= 1;
   const currentPage = page(currentPageId);
-  pageNameElement.textContent = currentPage ? `/ ${currentPage.name}` : '';
+  pageNameElement.textContent = currentPage?.name || '';
+  stage.classList.toggle('is-image-page', currentPage?.type === 'image');
   renderPageList();
   if (!currentPage) {
     stage.innerHTML = '<div class="player-empty">项目还没有页面。</div>';
@@ -214,18 +252,47 @@ async function render() {
 
 window.addEventListener('message', (event) => {
   const data = event.data;
-  if (!data || data.type !== 'uipm-element-click' || data.pageId !== currentPageId) return;
-  if (frameController && !frameController.ownsMessage(event)) return;
+  if (!data || data.pageId !== currentPageId || !frameController?.ownsMessage(event)) return;
+  if (data.type === 'uipm-preview-key' && data.key === 'Escape') {
+    toggleMenu();
+    return;
+  }
+  if (data.type !== 'uipm-element-click') return;
   const interaction = interactions(currentPageId).find(
     (item) => item.kind === 'element' && item.payload.elementId === data.elementId,
   );
   executeInteraction(interaction);
 });
 
-backBtn.addEventListener('click', goBack);
-navToggle.addEventListener('click', () => {
-  const collapsed = root.classList.toggle('nav-collapsed');
-  navToggle.setAttribute('aria-expanded', String(!collapsed));
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    if (event.repeat) return;
+    event.preventDefault();
+    toggleMenu();
+    return;
+  }
+  if (!menuOpen || event.key !== 'Tab') return;
+  const focusable = focusableMenuElements();
+  if (!focusable.length) {
+    event.preventDefault();
+    return;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}, true);
+
+backBtn.addEventListener('click', () => {
+  goBack();
+  setMenuOpen(false);
 });
+menuCloseBtn.addEventListener('click', () => setMenuOpen(false));
+menuBackdrop.addEventListener('click', () => setMenuOpen(false));
 
 void load();

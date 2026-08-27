@@ -8,14 +8,28 @@
 </head>
 <body class="player-body">
   <div id="player" data-project-id="{{ project.id }}" class="player-shell">
-    <header class="player-topbar">
-      <div class="player-topbar-left"><button id="navToggle" class="ghost-btn player-nav-toggle" type="button" aria-expanded="true">☰ 页面</button><button id="backBtn" class="ghost-btn">← 返回</button></div>
-      <div class="player-title"><strong>{{ project.name }}</strong><span id="playerPageName"></span></div>
-      <div class="player-topbar-left"><a href="/project/{{ project.id }}" class="ghost-btn">退出预览</a><a href="/logout" class="ghost-btn">退出登录</a></div>
-    </header>
-    <div class="player-content">
-      <aside id="playerNav" class="player-nav" aria-label="页面导航"><div class="player-nav-heading">全部页面 <span id="playerPageCount" class="count-pill">0</span></div><div id="playerPageList" class="player-page-list"></div></aside>
-      <main id="playerStage" class="player-stage"></main>
+    <main id="playerStage" class="player-stage" tabindex="-1"></main>
+    <div id="playerMenuLayer" class="player-menu-layer" aria-hidden="true" inert>
+      <div id="playerMenuBackdrop" class="player-menu-backdrop" aria-hidden="true"></div>
+      <aside class="player-menu" role="dialog" aria-modal="true" aria-labelledby="playerMenuTitle">
+        <header class="player-menu-header">
+          <div class="player-menu-title">
+            <strong id="playerMenuTitle">{{ project.name }}</strong>
+            <span id="playerPageName"></span>
+          </div>
+          <button id="menuCloseBtn" class="player-menu-close" type="button" aria-label="关闭菜单">×</button>
+        </header>
+        <div class="player-menu-actions">
+          <button id="backBtn" class="ghost-btn" type="button">← 返回</button>
+          <a href="/project/{{ project.id }}" class="ghost-btn">退出预览</a>
+          <a href="/logout" class="ghost-btn">退出登录</a>
+        </div>
+        <nav class="player-nav" aria-label="页面导航">
+          <div class="player-nav-heading">全部页面 <span id="playerPageCount" class="count-pill">0</span></div>
+          <div id="playerPageList" class="player-page-list"></div>
+        </nav>
+        <div class="player-menu-footer"><kbd>ESC</kbd><span>关闭菜单</span></div>
+      </aside>
     </div>
   </div>
   <script src="/static/frame-fit.js"></script>

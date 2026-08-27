@@ -39,6 +39,7 @@ DEFAULT_RENDER_MODE = "auto"
 DEFAULT_VIEWPORT_WIDTH = 1920
 DEFAULT_VIEWPORT_HEIGHT = 1080
 RENDER_MODES = {"auto", "responsive", "fixed"}
+HTML_INSTRUMENTATION_VERSION = 1
 
 app = FastAPI(title="UI Prototype Manager", version="0.5.0")
 app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
@@ -142,6 +143,7 @@ def init_db() -> None:
                 render_mode TEXT NOT NULL DEFAULT 'auto' CHECK(render_mode IN ('auto', 'responsive', 'fixed')),
                 viewport_width INTEGER NOT NULL DEFAULT 1920,
                 viewport_height INTEGER NOT NULL DEFAULT 1080,
+                instrumentation_version INTEGER NOT NULL DEFAULT 0,
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -180,6 +182,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE pages ADD COLUMN viewport_width INTEGER NOT NULL DEFAULT 1920")
         if "viewport_height" not in page_columns:
             conn.execute("ALTER TABLE pages ADD COLUMN viewport_height INTEGER NOT NULL DEFAULT 1080")
+        if "instrumentation_version" not in page_columns:
+            conn.execute("ALTER TABLE pages ADD COLUMN instrumentation_version INTEGER NOT NULL DEFAULT 0")
 
 
 @app.on_event("startup")
@@ -485,7 +489,9 @@ def api_project(project_id: str):
         interactions = conn.execute(
             "SELECT * FROM interactions WHERE project_id = ? ORDER BY created_at", (project_id,)
         ).fetchall()
-    project["pages"] = [page_to_api(row_to_dict(r)) for r in pages]
+    project["pages"] = [
+        page_to_api(ensure_html_instrumentation(row_to_dict(row))) for row in pages
+    ]
     parsed: list[dict[str, Any]] = []
     for row in interactions:
         item = row_to_dict(row)
@@ -578,13 +584,15 @@ async def api_upload_pages(
                     """
                     INSERT INTO pages(
                         id, project_id, name, type, storage_backend, storage_key,
-                        render_mode, viewport_width, viewport_height, sort_order, created_at
+                        render_mode, viewport_width, viewport_height, instrumentation_version,
+                        sort_order, created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         item["id"], project_id, item["name"], item["type"], backend, item["key"],
                         normalized_render_mode, normalized_viewport_width, normalized_viewport_height,
+                        HTML_INSTRUMENTATION_VERSION if item["type"] == "html" else 0,
                         next_order + offset, now_iso(),
                     ),
                 )
@@ -641,7 +649,7 @@ def api_delete_page(page_id: str):
 
 @app.get("/api/pages/{page_id}/content-url")
 def api_page_content_url(page_id: str):
-    page = page_to_api(get_page(page_id))
+    page = page_to_api(ensure_html_instrumentation(get_page(page_id)))
     return {
         "content_url": page["content_url"],
         "content_url_expires_at": page["content_url_expires_at"],
@@ -666,7 +674,19 @@ def api_page_file(page_id: str):
     return Response(content=content, media_type=media_type, headers={"Cache-Control": "private, max-age=60"})
 
 
+def strip_html_instrumentation(source: str) -> str:
+    for tag, element_id in (("style", "__uipm_style"), ("script", "__uipm_script")):
+        source = re.sub(
+            rf"<{tag}\b[^>]*\bid=[\"']{element_id}[\"'][^>]*>.*?</{tag}\s*>",
+            "",
+            source,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    return source
+
+
 def instrument_html(page_id: str, source: str) -> str:
+    source = strip_html_instrumentation(source)
     source = re.sub(
         r"<meta[^>]+http-equiv=[\"']?Content-Security-Policy[\"']?[^>]*>",
         "",
@@ -691,6 +711,7 @@ html[data-uipm-mode="edit"] [data-ui-id]:hover{outline:2px solid #2563eb!importa
 <script id="__uipm_script">
 (() => {
   const PAGE_ID = __PAGE_ID__;
+  const INSTRUMENTATION_VERSION = __INSTRUMENTATION_VERSION__;
   const hashMode = new URLSearchParams(location.hash.slice(1)).get('uipm-mode');
   const queryMode = new URLSearchParams(location.search).get('mode');
   const EDIT_MODE = (hashMode || queryMode) === 'edit';
@@ -878,6 +899,16 @@ html[data-uipm-mode="edit"] [data-ui-id]:hover{outline:2px solid #2563eb!importa
       document.body.appendChild(overlayRoot);
     }
 
+    document.addEventListener('keydown', (event) => {
+      if (EDIT_MODE || event.key !== 'Escape' || event.repeat) return;
+      event.preventDefault();
+      event.stopPropagation();
+      window.parent.postMessage({
+        type: 'uipm-preview-key', pageId: PAGE_ID, key: 'Escape',
+        instrumentationVersion: INSTRUMENTATION_VERSION
+      }, '*');
+    }, true);
+
     document.addEventListener('click', (event) => {
       const target = interactionTarget(event.target, true);
       if (!target) return;
@@ -937,6 +968,7 @@ html[data-uipm-mode="edit"] [data-ui-id]:hover{outline:2px solid #2563eb!importa
 </script>
 """
     script = script.replace("__PAGE_ID__", json.dumps(page_id))
+    script = script.replace("__INSTRUMENTATION_VERSION__", str(HTML_INSTRUMENTATION_VERSION))
     injection = css + script
     if re.search(r"</body\s*>", source, flags=re.IGNORECASE):
         return re.sub(r"</body\s*>", lambda _m: injection + "</body>", source, count=1, flags=re.IGNORECASE)
@@ -956,9 +988,39 @@ def prepare_html_asset(page_id: str, raw: bytes) -> bytes:
     return instrument_html(page_id, decode_html(raw)).encode("utf-8")
 
 
+def ensure_html_instrumentation(page: dict[str, Any]) -> dict[str, Any]:
+    item = dict(page)
+    if item["type"] != "html":
+        return item
+    version = int(item.get("instrumentation_version") or 0)
+    if version >= HTML_INSTRUMENTATION_VERSION:
+        return item
+    try:
+        prepared = prepare_html_asset(item["id"], read_asset(item))
+        store_asset(
+            backend=item["storage_backend"],
+            key=item["storage_key"],
+            data=prepared,
+            media_type="text/html; charset=utf-8",
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(404, "Asset not found") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, f"Failed to update HTML runtime: {exc}") from exc
+    with db() as conn:
+        conn.execute(
+            "UPDATE pages SET instrumentation_version = ? WHERE id = ?",
+            (HTML_INSTRUMENTATION_VERSION, item["id"]),
+        )
+    item["instrumentation_version"] = HTML_INSTRUMENTATION_VERSION
+    return item
+
+
 @app.get("/api/pages/{page_id}/render", response_class=HTMLResponse)
 def api_render_html(page_id: str, mode: str = "edit"):
-    page = get_page(page_id)
+    page = ensure_html_instrumentation(get_page(page_id))
     if page["type"] != "html":
         raise HTTPException(400, "Not an HTML page")
     if mode not in {"edit", "play"}:

@@ -137,5 +137,59 @@ class InjectedEditorTests(unittest.TestCase):
         self.assertIn("uipm-element-click", rendered)
 
 
+class HtmlInstrumentationUpgradeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.previous_paths = (main.DATA_DIR, main.DB_PATH, main.ASSET_DIR)
+        main.DATA_DIR = Path(self.temp_dir.name).resolve()
+        main.DB_PATH = main.DATA_DIR / "app.db"
+        main.ASSET_DIR = main.DATA_DIR / "assets"
+        main.init_db()
+
+    def tearDown(self) -> None:
+        main.DATA_DIR, main.DB_PATH, main.ASSET_DIR = self.previous_paths
+        self.temp_dir.cleanup()
+
+    def test_legacy_local_html_is_upgraded_once(self) -> None:
+        created_at = main.now_iso()
+        key = "assets/project-a/page-a.html"
+        path = main.local_asset_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '<body><button>Open</button><style id="__uipm_style">old</style>'
+            '<script id="__uipm_script">old</script></body>',
+            encoding="utf-8",
+        )
+        with main.db() as connection:
+            connection.execute(
+                "INSERT INTO projects(id, name, created_at) VALUES (?, ?, ?)",
+                ("project-a", "Project A", created_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO pages(
+                    id, project_id, name, type, storage_backend, storage_key, created_at
+                ) VALUES (?, ?, ?, 'html', 'local', ?, ?)
+                """,
+                ("page-a", "project-a", "Page A", key, created_at),
+            )
+
+        upgraded = main.ensure_html_instrumentation(main.get_page("page-a"))
+        first_content = path.read_text(encoding="utf-8")
+        upgraded_again = main.ensure_html_instrumentation(main.get_page("page-a"))
+
+        self.assertEqual(
+            upgraded["instrumentation_version"], main.HTML_INSTRUMENTATION_VERSION
+        )
+        self.assertEqual(
+            upgraded_again["instrumentation_version"],
+            upgraded["instrumentation_version"],
+        )
+        self.assertEqual(first_content, path.read_text(encoding="utf-8"))
+        self.assertEqual(first_content.count('id="__uipm_script"'), 1)
+        self.assertNotIn(">old</script>", first_content)
+        self.assertIn("uipm-preview-key", first_content)
+
+
 if __name__ == "__main__":
     unittest.main()

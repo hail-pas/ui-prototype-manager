@@ -22,11 +22,11 @@
   function create(options) {
     const host = options.host;
     const pageId = String(options.pageId || '');
+    const variant = options.variant === 'player' ? 'player' : 'editor';
     const requestedMode = ['auto', 'responsive', 'fixed'].includes(options.renderMode) ? options.renderMode : 'auto';
     const configuredWidth = numberInRange(options.viewportWidth, DEFAULT_WIDTH);
     const configuredHeight = numberInRange(options.viewportHeight, DEFAULT_HEIGHT);
-    const variant = options.variant === 'player' ? 'player' : 'editor';
-    const maxWidth = variant === 'player' ? 1600 : 1400;
+    const maxWidth = 1400;
     let activeMode = requestedMode === 'fixed' ? 'fixed' : 'responsive';
     let designWidth = configuredWidth;
     let designHeight = configuredHeight;
@@ -48,15 +48,17 @@
     function layoutResponsive() {
       if (destroyed) return;
       const available = availableSize(host);
-      const outerWidth = Math.max(1, Math.min(available.width, maxWidth));
-      const innerWidth = Math.max(1, outerWidth - 2);
+      const outerWidth = variant === 'player'
+        ? available.width
+        : Math.max(1, Math.min(available.width, maxWidth));
+      const innerWidth = variant === 'player' ? outerWidth : Math.max(1, outerWidth - 2);
       const innerHeight = variant === 'player'
-        ? Math.max(1, available.height - 2)
+        ? available.height
         : Math.max(1, Number(options.responsiveHeight) || 720);
       wrap.classList.remove('is-fixed');
       wrap.classList.add('is-responsive');
       wrap.style.width = `${outerWidth}px`;
-      wrap.style.height = `${innerHeight + 2}px`;
+      wrap.style.height = `${variant === 'player' ? innerHeight : innerHeight + 2}px`;
       viewport.style.width = `${innerWidth}px`;
       viewport.style.height = `${innerHeight}px`;
       iframe.style.position = 'static';
@@ -68,6 +70,22 @@
     function layoutFixed() {
       if (destroyed) return;
       const available = availableSize(host);
+      if (variant === 'player') {
+        // Keep the configured layout width stable while using every visible pixel.
+        const scale = Math.max(0.01, available.width / designWidth);
+        const virtualHeight = Math.max(1, available.height / scale);
+        wrap.classList.remove('is-responsive');
+        wrap.classList.add('is-fixed');
+        wrap.style.width = `${available.width}px`;
+        wrap.style.height = `${available.height}px`;
+        viewport.style.width = `${available.width}px`;
+        viewport.style.height = `${available.height}px`;
+        iframe.style.position = 'absolute';
+        iframe.style.width = `${designWidth}px`;
+        iframe.style.height = `${virtualHeight}px`;
+        iframe.style.transform = `scale(${scale})`;
+        return;
+      }
       const innerAvailableWidth = Math.max(1, Math.min(available.width, maxWidth) - 2);
       const innerAvailableHeight = Math.max(1, available.height - 2);
       const scale = Math.max(0.01, Math.min(

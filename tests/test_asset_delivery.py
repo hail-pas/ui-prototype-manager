@@ -44,6 +44,16 @@ class HtmlInstrumentationTests(unittest.TestCase):
         self.assertIn("中文页面", decoded)
         self.assertIn('const PAGE_ID = "page-456";', decoded)
 
+    def test_instrumentation_is_idempotent_and_contains_preview_key_bridge(self) -> None:
+        first = instrument_html("page-789", "<body><input></body>")
+        second = instrument_html("page-789", first)
+
+        self.assertEqual(second.count('id="__uipm_style"'), 1)
+        self.assertEqual(second.count('id="__uipm_script"'), 1)
+        self.assertIn("uipm-preview-key", second)
+        self.assertIn("event.key !== 'Escape'", second)
+        self.assertNotIn("const INSTRUMENTATION_VERSION = __", second)
+
 
 class PageSerializationTests(unittest.TestCase):
     def test_local_page_uses_application_content_route(self) -> None:
