@@ -1,79 +1,231 @@
-const root=document.getElementById('player');
-const projectId=root.dataset.projectId;
-const stage=document.getElementById('playerStage');
-const backBtn=document.getElementById('backBtn');
-const navToggle=document.getElementById('navToggle');
-const nav=document.getElementById('playerNav');
-const pageList=document.getElementById('playerPageList');
-const pageCount=document.getElementById('playerPageCount');
-const pageNameEl=document.getElementById('playerPageName');
-let state={pages:[],interactions:[]};
-let historyStack=[];
-let currentPageId=null;
-let frameController=null;
-function esc(s=''){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
-function page(id){return state.pages.find(p=>p.id===id)}
-function interactions(id){return state.interactions.filter(i=>i.source_page_id===id)}
+const root = document.getElementById('player');
+const projectId = root.dataset.projectId;
+const stage = document.getElementById('playerStage');
+const backBtn = document.getElementById('backBtn');
+const navToggle = document.getElementById('navToggle');
+const pageList = document.getElementById('playerPageList');
+const pageCount = document.getElementById('playerPageCount');
+const pageNameElement = document.getElementById('playerPageName');
 
-async function load(){
-  const res=await fetch(`/api/projects/${projectId}`);
-  if(res.status===401){location.href=`/login?next=${encodeURIComponent(location.pathname+location.search)}`;return;}
-  if(!res.ok){stage.innerHTML='<div class="player-empty">加载失败</div>';return;}
-  state=await res.json();
-  const q=new URLSearchParams(location.search).get('page');
-  currentPageId=state.pages.some(p=>p.id===q)?q:state.pages[0]?.id||null;
-  if(currentPageId)historyStack=[currentPageId];
-  pageCount.textContent=state.pages.length;
-  render();
+let state = {pages: [], interactions: []};
+let historyStack = [];
+let currentPageId = null;
+let frameController = null;
+let renderVersion = 0;
+const contentUrlRefreshes = new Map();
+
+function esc(value = '') {
+  const element = document.createElement('div');
+  element.textContent = value;
+  return element.innerHTML;
 }
-function updateUrl(id){
-  const url=new URL(location.href);
-  if(id) url.searchParams.set('page',id); else url.searchParams.delete('page');
-  history.replaceState(null,'',url);
+
+function page(pageId) {
+  return state.pages.find((item) => item.id === pageId);
 }
-function navigate(id){
-  if(!state.pages.some(p=>p.id===id) || id===currentPageId)return;
-  currentPageId=id;historyStack.push(id);updateUrl(id);render();
+
+function interactions(pageId) {
+  return state.interactions.filter((item) => item.source_page_id === pageId);
 }
-function goBack(){
-  if(historyStack.length<=1)return;
+
+async function api(url) {
+  const response = await fetch(url);
+  if (response.status === 401) {
+    location.href = `/login?next=${encodeURIComponent(location.pathname + location.search)}`;
+    throw new Error('登录已过期');
+  }
+  if (!response.ok) {
+    let message = '加载失败';
+    try {
+      const data = await response.json();
+      message = data.detail || message;
+    } catch {}
+    throw new Error(message);
+  }
+  return response.json();
+}
+
+function contentUrlExpiring(item, skewMs = 60_000) {
+  if (!item.content_url_expires_at) return false;
+  const expiresAt = Date.parse(item.content_url_expires_at);
+  return !Number.isFinite(expiresAt) || expiresAt - Date.now() <= skewMs;
+}
+
+function pageContentUrl(item, mode = null) {
+  const fallback = item.type === 'html'
+    ? `/api/pages/${item.id}/render`
+    : `/api/pages/${item.id}/file`;
+  const url = new URL(item.content_url || fallback, location.href);
+  if (mode) url.hash = new URLSearchParams({'uipm-mode': mode}).toString();
+  return url.href;
+}
+
+async function refreshPageContentUrl(item) {
+  if (!contentUrlRefreshes.has(item.id)) {
+    const refresh = api(`/api/pages/${item.id}/content-url`)
+      .then((data) => Object.assign(item, data))
+      .finally(() => contentUrlRefreshes.delete(item.id));
+    contentUrlRefreshes.set(item.id, refresh);
+  }
+  await contentUrlRefreshes.get(item.id);
+}
+
+async function load() {
+  try {
+    state = await api(`/api/projects/${projectId}`);
+  } catch (error) {
+    stage.innerHTML = `<div class="player-empty">${esc(error.message)}</div>`;
+    return;
+  }
+  const requestedPageId = new URLSearchParams(location.search).get('page');
+  currentPageId = state.pages.some((item) => item.id === requestedPageId)
+    ? requestedPageId
+    : state.pages[0]?.id || null;
+  if (currentPageId) historyStack = [currentPageId];
+  pageCount.textContent = state.pages.length;
+  void render();
+}
+
+function updateUrl(pageId) {
+  const url = new URL(location.href);
+  if (pageId) url.searchParams.set('page', pageId);
+  else url.searchParams.delete('page');
+  history.replaceState(null, '', url);
+}
+
+function navigate(pageId) {
+  if (!state.pages.some((item) => item.id === pageId) || pageId === currentPageId) return;
+  currentPageId = pageId;
+  historyStack.push(pageId);
+  updateUrl(pageId);
+  void render();
+}
+
+function goBack() {
+  if (historyStack.length <= 1) return;
   historyStack.pop();
-  currentPageId=historyStack[historyStack.length-1];
+  currentPageId = historyStack[historyStack.length - 1];
   updateUrl(currentPageId);
-  render();
+  void render();
 }
-function executeInteraction(i){
-  if(!i)return;
-  if(i.action==='back'){goBack();return;}
-  if(i.action==='navigate' && i.target_page_id)navigate(i.target_page_id);
-}
-function renderPageList(){
-  if(!state.pages.length){pageList.innerHTML='<div class="player-nav-empty">暂无页面</div>';return;}
-  pageList.innerHTML=state.pages.map(p=>`<button type="button" class="player-page-item ${p.id===currentPageId?'active':''}" data-id="${p.id}"><span class="player-page-type">${p.type==='html'?'HTML':'IMG'}</span><span class="player-page-name">${esc(p.name)}</span></button>`).join('');
-  pageList.querySelectorAll('.player-page-item').forEach(btn=>btn.addEventListener('click',()=>navigate(btn.dataset.id)));
-}
-function render(){
-  if(frameController){frameController.destroy();frameController=null;}
-  backBtn.disabled=historyStack.length<=1;
-  const p=page(currentPageId);pageNameEl.textContent=p?`/ ${p.name}`:'';
-  renderPageList();
-  if(!p){stage.innerHTML='<div class="player-empty">项目还没有页面。</div>';return;}
-  if(p.type==='html'){
-    frameController=window.UIPMFrameFit.create({
-      host:stage,pageId:p.id,title:p.name,src:`/api/pages/${p.id}/render?mode=play`,variant:'player',
-      renderMode:p.render_mode||'auto',viewportWidth:p.viewport_width||1920,viewportHeight:p.viewport_height||1080,
-    });
-  }else{
-    stage.innerHTML=`<div id="playImageStage" class="player-image-stage"><img src="/api/pages/${p.id}/file" alt="${esc(p.name)}" /></div>`;
-    const s=document.getElementById('playImageStage');
-    interactions(p.id).filter(i=>i.kind==='region').forEach(i=>{const r=i.payload;const b=document.createElement('button');b.className='player-hotspot';b.type='button';b.title=i.action==='back'?'返回上一页':`跳转到 ${page(i.target_page_id)?.name||''}`;Object.assign(b.style,{left:`${r.x*100}%`,top:`${r.y*100}%`,width:`${r.width*100}%`,height:`${r.height*100}%`});b.addEventListener('click',()=>executeInteraction(i));s.appendChild(b);});
+
+function executeInteraction(interaction) {
+  if (!interaction) return;
+  if (interaction.action === 'back') {
+    goBack();
+    return;
+  }
+  if (interaction.action === 'navigate' && interaction.target_page_id) {
+    navigate(interaction.target_page_id);
   }
 }
-window.addEventListener('message',e=>{const d=e.data;if(!d||d.type!=='uipm-element-click'||d.pageId!==currentPageId)return;if(frameController&&!frameController.ownsMessage(e))return;const hit=interactions(currentPageId).find(i=>i.kind==='element'&&i.payload.elementId===d.elementId);executeInteraction(hit);});
-backBtn.addEventListener('click',goBack);
-navToggle.addEventListener('click',()=>{
-  const collapsed=root.classList.toggle('nav-collapsed');
-  navToggle.setAttribute('aria-expanded', String(!collapsed));
-  navToggle.textContent=collapsed?'☰ 页面':'☰ 页面';
+
+function renderPageList() {
+  if (!state.pages.length) {
+    pageList.innerHTML = '<div class="player-nav-empty">暂无页面</div>';
+    return;
+  }
+  pageList.innerHTML = state.pages.map((item) => `
+    <button type="button" class="player-page-item ${item.id === currentPageId ? 'active' : ''}" data-id="${item.id}">
+      <span class="player-page-type">${item.type === 'html' ? 'HTML' : 'IMG'}</span>
+      <span class="player-page-name">${esc(item.name)}</span>
+    </button>`).join('');
+  pageList.querySelectorAll('.player-page-item').forEach((button) => {
+    button.addEventListener('click', () => navigate(button.dataset.id));
+  });
+}
+
+async function render() {
+  const currentRenderVersion = ++renderVersion;
+  if (frameController) {
+    frameController.destroy();
+    frameController = null;
+  }
+  backBtn.disabled = historyStack.length <= 1;
+  const currentPage = page(currentPageId);
+  pageNameElement.textContent = currentPage ? `/ ${currentPage.name}` : '';
+  renderPageList();
+  if (!currentPage) {
+    stage.innerHTML = '<div class="player-empty">项目还没有页面。</div>';
+    return;
+  }
+
+  if (contentUrlExpiring(currentPage)) {
+    stage.innerHTML = '<div class="player-empty">正在刷新资源访问地址…</div>';
+    try {
+      await refreshPageContentUrl(currentPage);
+    } catch (error) {
+      if (currentRenderVersion === renderVersion) {
+        stage.innerHTML = `<div class="player-empty">${esc(error.message)}</div>`;
+      }
+      return;
+    }
+    if (currentRenderVersion !== renderVersion || currentPage.id !== currentPageId) return;
+  }
+
+  if (currentPage.type === 'html') {
+    frameController = window.UIPMFrameFit.create({
+      host: stage,
+      pageId: currentPage.id,
+      title: currentPage.name,
+      src: pageContentUrl(currentPage, 'play'),
+      variant: 'player',
+      renderMode: currentPage.render_mode || 'auto',
+      viewportWidth: currentPage.viewport_width || 1920,
+      viewportHeight: currentPage.viewport_height || 1080,
+    });
+    return;
+  }
+
+  stage.innerHTML = `
+    <div id="playImageStage" class="player-image-stage">
+      <img id="playerPageImage" src="${esc(pageContentUrl(currentPage))}" alt="${esc(currentPage.name)}">
+    </div>`;
+  const imageStage = document.getElementById('playImageStage');
+  const image = document.getElementById('playerPageImage');
+  image.addEventListener('error', async () => {
+    if (image.dataset.contentUrlRetried === 'true') return;
+    image.dataset.contentUrlRetried = 'true';
+    try {
+      await refreshPageContentUrl(currentPage);
+      if (currentPage.id === currentPageId) image.src = pageContentUrl(currentPage);
+    } catch (error) {
+      stage.innerHTML = `<div class="player-empty">${esc(error.message)}</div>`;
+    }
+  });
+  interactions(currentPage.id).filter((item) => item.kind === 'region').forEach((interaction) => {
+    const region = interaction.payload;
+    const hotspot = document.createElement('button');
+    hotspot.className = 'player-hotspot';
+    hotspot.type = 'button';
+    hotspot.title = interaction.action === 'back'
+      ? '返回上一页'
+      : `跳转到 ${page(interaction.target_page_id)?.name || ''}`;
+    Object.assign(hotspot.style, {
+      left: `${region.x * 100}%`,
+      top: `${region.y * 100}%`,
+      width: `${region.width * 100}%`,
+      height: `${region.height * 100}%`,
+    });
+    hotspot.addEventListener('click', () => executeInteraction(interaction));
+    imageStage.appendChild(hotspot);
+  });
+}
+
+window.addEventListener('message', (event) => {
+  const data = event.data;
+  if (!data || data.type !== 'uipm-element-click' || data.pageId !== currentPageId) return;
+  if (frameController && !frameController.ownsMessage(event)) return;
+  const interaction = interactions(currentPageId).find(
+    (item) => item.kind === 'element' && item.payload.elementId === data.elementId,
+  );
+  executeInteraction(interaction);
 });
-load();
+
+backBtn.addEventListener('click', goBack);
+navToggle.addEventListener('click', () => {
+  const collapsed = root.classList.toggle('nav-collapsed');
+  navToggle.setAttribute('aria-expanded', String(!collapsed));
+});
+
+void load();

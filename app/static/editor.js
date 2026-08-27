@@ -21,6 +21,13 @@ const uploadRows = document.getElementById('uploadRows');
 const uploadRenderMode = document.getElementById('uploadRenderMode');
 const uploadViewportWidth = document.getElementById('uploadViewportWidth');
 const uploadViewportHeight = document.getElementById('uploadViewportHeight');
+const uploadDialogTitle = document.getElementById('uploadDialogTitle');
+const uploadCancel = document.getElementById('uploadCancel');
+const uploadSubmit = document.getElementById('uploadSubmit');
+const uploadSubmitLabel = document.getElementById('uploadSubmitLabel');
+const uploadStatus = document.getElementById('uploadStatus');
+const uploadStatusTitle = document.getElementById('uploadStatusTitle');
+const uploadStatusDetail = document.getElementById('uploadStatusDetail');
 const renderSettingsSection = document.getElementById('renderSettingsSection');
 const renderSettingsPanel = document.getElementById('renderSettingsPanel');
 
@@ -39,6 +46,11 @@ let drawing = null;
 let renameTarget = null;
 let pendingFiles = [];
 let frameController = null;
+let canvasRenderVersion = 0;
+const contentUrlRefreshes = new Map();
+let uploadStartedAt = 0;
+let uploadTimer = null;
+let uploadInProgress = false;
 
 function esc(value = '') {
   const element = document.createElement('div');
@@ -67,7 +79,8 @@ function pageName(pageId) {
 }
 
 function storageLabel(page) {
-  return (page.storage_backend || 'local') === 's3' ? 'S3' : 'LOCAL';
+  if ((page.storage_backend || 'local') !== 's3') return 'LOCAL';
+  return config.s3?.provider === 'oss' ? 'OSS' : 'S3';
 }
 
 function interactionView(interaction) {
@@ -110,6 +123,37 @@ function confirmDiscardSelection() {
   return window.confirm('当前交互配置尚未保存，是否放弃修改？');
 }
 
+function uploadElapsedSeconds() {
+  return Math.max(0, Math.floor((Date.now() - uploadStartedAt) / 1000));
+}
+
+function updateUploadStatusDetail(fileCount) {
+  uploadStatusDetail.textContent = `${fileCount} 个文件 · 请保持当前页面打开 · 已耗时 ${uploadElapsedSeconds()} 秒`;
+}
+
+function setUploadInProgress(inProgress, fileCount = pendingFiles.length) {
+  uploadInProgress = inProgress;
+  uploadForm.setAttribute('aria-busy', String(inProgress));
+  uploadDialog.classList.toggle('is-uploading', inProgress);
+  uploadForm.querySelectorAll('input, select, button').forEach((control) => {
+    control.disabled = inProgress;
+  });
+  uploadStatus.hidden = !inProgress;
+  uploadDialogTitle.textContent = inProgress ? '正在上传页面…' : '确认上传页面';
+  uploadSubmitLabel.textContent = inProgress ? '上传中…' : '上传';
+
+  if (uploadTimer) {
+    clearInterval(uploadTimer);
+    uploadTimer = null;
+  }
+  if (!inProgress) return;
+
+  uploadStartedAt = Date.now();
+  uploadStatusTitle.textContent = '正在上传并处理文件…';
+  updateUploadStatusDetail(fileCount);
+  uploadTimer = setInterval(() => updateUploadStatusDetail(fileCount), 1000);
+}
+
 function goLogin() {
   location.href = `/login?next=${encodeURIComponent(location.pathname + location.search)}`;
 }
@@ -131,14 +175,40 @@ async function api(url, options = {}) {
   return response.status === 204 ? null : response.json();
 }
 
+function contentUrlExpiring(page, skewMs = 60_000) {
+  if (!page.content_url_expires_at) return false;
+  const expiresAt = Date.parse(page.content_url_expires_at);
+  return !Number.isFinite(expiresAt) || expiresAt - Date.now() <= skewMs;
+}
+
+function pageContentUrl(page, mode = null) {
+  const fallback = page.type === 'html'
+    ? `/api/pages/${page.id}/render`
+    : `/api/pages/${page.id}/file`;
+  const url = new URL(page.content_url || fallback, location.href);
+  if (mode) url.hash = new URLSearchParams({'uipm-mode': mode}).toString();
+  return url.href;
+}
+
+async function refreshPageContentUrl(page) {
+  if (!contentUrlRefreshes.has(page.id)) {
+    const refresh = api(`/api/pages/${page.id}/content-url`)
+      .then((data) => Object.assign(page, data))
+      .finally(() => contentUrlRefreshes.delete(page.id));
+    contentUrlRefreshes.set(page.id, refresh);
+  }
+  await contentUrlRefreshes.get(page.id);
+}
+
 async function loadConfig() {
   config = await api('/api/config');
+  const remoteStorageLabel = config.s3?.provider === 'oss' ? 'OSS' : 'S3';
   storageSelect.innerHTML = config.storage_backends
-    .map((backend) => `<option value="${backend}">${backend === 's3' ? 'S3' : '本地'}</option>`)
+    .map((backend) => `<option value="${backend}">${backend === 's3' ? remoteStorageLabel : '本地'}</option>`)
     .join('');
   storageSelect.value = config.default_storage_backend || 'local';
   storageSelect.title = config.s3?.configured
-    ? `S3 已配置：${config.s3.bucket}`
+    ? `${remoteStorageLabel} 已配置：${config.s3.bucket}`
     : `本地目录：${config.data_dir}`;
 }
 
@@ -202,7 +272,8 @@ function renderPageList() {
   });
 }
 
-function renderCanvas() {
+async function renderCanvas() {
+  const renderVersion = ++canvasRenderVersion;
   if (frameController) {
     frameController.destroy();
     frameController = null;
@@ -222,6 +293,19 @@ function renderCanvas() {
     return;
   }
 
+  if (contentUrlExpiring(page)) {
+    canvasArea.innerHTML = '<div class="empty-state"><p>正在刷新资源访问地址…</p></div>';
+    try {
+      await refreshPageContentUrl(page);
+    } catch (error) {
+      if (renderVersion === canvasRenderVersion) {
+        canvasArea.innerHTML = `<div class="empty-state"><p>${esc(error.message)}</p></div>`;
+      }
+      return;
+    }
+    if (renderVersion !== canvasRenderVersion || page.id !== currentPageId) return;
+  }
+
   currentPageName.textContent = page.name;
   const renderLabel = page.type === 'html'
     ? ` · ${{auto: '自动', fixed: '固定', responsive: '响应式'}[page.render_mode || 'auto'] || '自动'}`
@@ -235,7 +319,7 @@ function renderCanvas() {
       pageId: page.id,
       iframeId: 'htmlFrame',
       title: page.name,
-      src: `/api/pages/${page.id}/render?mode=edit`,
+      src: pageContentUrl(page, 'edit'),
       variant: 'editor',
       responsiveHeight: 720,
       renderMode: page.render_mode || 'auto',
@@ -249,10 +333,20 @@ function renderCanvas() {
   modeHelp.textContent = '拖拽创建新区域；点击已有区域或右侧条目可双向定位';
   canvasArea.innerHTML = `
     <div id="imageStage" class="image-stage">
-      <img id="pageImage" src="/api/pages/${page.id}/file" alt="${esc(page.name)}">
+      <img id="pageImage" src="${esc(pageContentUrl(page))}" alt="${esc(page.name)}">
     </div>`;
   const image = document.getElementById('pageImage');
-  if (image.complete) initImageStage();
+  image.addEventListener('error', async () => {
+    if (image.dataset.contentUrlRetried === 'true') return;
+    image.dataset.contentUrlRetried = 'true';
+    try {
+      await refreshPageContentUrl(page);
+      if (page.id === currentPageId) image.src = pageContentUrl(page);
+    } catch (error) {
+      alert(error.message);
+    }
+  });
+  if (image.complete && image.naturalWidth > 0) initImageStage();
   else image.addEventListener('load', initImageStage, {once: true});
 }
 
@@ -820,13 +914,22 @@ function prepareUpload(files) {
 }
 
 document.getElementById('fileInput').addEventListener('change', (event) => prepareUpload(event.target.files));
-document.getElementById('uploadCancel').addEventListener('click', () => {
+uploadCancel.addEventListener('click', () => {
+  if (uploadInProgress) return;
   pendingFiles = [];
   uploadDialog.close();
+});
+uploadDialog.addEventListener('cancel', (event) => {
+  if (uploadInProgress) {
+    event.preventDefault();
+    return;
+  }
+  pendingFiles = [];
 });
 
 uploadForm.addEventListener('submit', async (event) => {
   event.preventDefault();
+  if (uploadInProgress) return;
   const inputs = Array.from(uploadRows.querySelectorAll('.upload-name-input'));
   const names = inputs.map((input) => input.value.trim().replace(/\s+/g, ' '));
   if (names.some((name) => !name)) return alert('页面名称不能为空');
@@ -852,12 +955,18 @@ uploadForm.addEventListener('submit', async (event) => {
   formData.append('viewport_width', String(viewportWidth));
   formData.append('viewport_height', String(viewportHeight));
   pendingFiles.forEach((file) => formData.append('files', file));
+  const fileCount = pendingFiles.length;
+  setUploadInProgress(true, fileCount);
   try {
     await api(`/api/projects/${projectId}/pages`, {method: 'POST', body: formData});
+    uploadDialogTitle.textContent = '上传完成';
+    uploadStatusTitle.textContent = '上传完成，正在刷新页面…';
+    await reload(false);
     uploadDialog.close();
     pendingFiles = [];
-    await reload(false);
+    setUploadInProgress(false);
   } catch (error) {
+    setUploadInProgress(false);
     alert(error.message);
   }
 });

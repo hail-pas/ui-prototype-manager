@@ -22,6 +22,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
+from app.object_storage import (
+    ObjectStorageConfigurationError,
+    object_storage,
+    object_storage_settings,
+)
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 APP_DIR = BASE_DIR / "app"
 DATA_DIR = Path(os.getenv("UIPM_DATA_DIR", str(Path.cwd() / "data"))).expanduser().resolve()
@@ -34,7 +40,7 @@ DEFAULT_VIEWPORT_WIDTH = 1920
 DEFAULT_VIEWPORT_HEIGHT = 1080
 RENDER_MODES = {"auto", "responsive", "fixed"}
 
-app = FastAPI(title="UI Prototype Manager", version="0.4.0")
+app = FastAPI(title="UI Prototype Manager", version="0.5.0")
 app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=APP_DIR / "templates")
 
@@ -179,6 +185,7 @@ def init_db() -> None:
 @app.on_event("startup")
 def startup() -> None:
     access_key()
+    object_storage_settings().validate()
     init_db()
 
 
@@ -246,47 +253,15 @@ def duplicate_error(entity: str, name: str) -> HTTPException:
     return HTTPException(409, f'{entity}名称“{name}”在当前项目中已存在')
 
 
-def s3_settings() -> dict[str, str | None]:
-    return {
-        "bucket": os.getenv("UIPM_S3_BUCKET") or None,
-        "endpoint_url": os.getenv("UIPM_S3_ENDPOINT_URL") or None,
-        "region": os.getenv("UIPM_S3_REGION", "us-east-1"),
-        "access_key": os.getenv("UIPM_S3_ACCESS_KEY_ID") or None,
-        "secret_key": os.getenv("UIPM_S3_SECRET_ACCESS_KEY") or None,
-        "prefix": os.getenv("UIPM_S3_PREFIX", "uipm").strip("/"),
-        "addressing_style": os.getenv("UIPM_S3_ADDRESSING_STYLE", "path"),
-    }
-
-
 def s3_configured() -> bool:
-    return bool(s3_settings()["bucket"])
-
-
-def s3_client():
-    if not s3_configured():
-        raise RuntimeError("S3 is not configured. Set UIPM_S3_BUCKET first.")
-    import boto3
-    from botocore.config import Config
-
-    cfg = s3_settings()
-    kwargs: dict[str, Any] = {
-        "region_name": cfg["region"],
-        "config": Config(s3={"addressing_style": cfg["addressing_style"]}),
-    }
-    if cfg["endpoint_url"]:
-        kwargs["endpoint_url"] = cfg["endpoint_url"]
-    if cfg["access_key"]:
-        kwargs["aws_access_key_id"] = cfg["access_key"]
-    if cfg["secret_key"]:
-        kwargs["aws_secret_access_key"] = cfg["secret_key"]
-    return boto3.client("s3", **kwargs)
+    return object_storage_settings().configured
 
 
 def asset_key(project_id: str, page_id: str, ext: str, backend: str) -> str:
     tail = f"{project_id}/{page_id}{ext}"
     if backend == "local":
         return f"assets/{tail}"
-    prefix = str(s3_settings()["prefix"] or "").strip("/")
+    prefix = object_storage_settings().prefix
     return f"{prefix}/{tail}" if prefix else tail
 
 
@@ -304,8 +279,7 @@ def store_asset(*, backend: str, key: str, data: bytes, media_type: str) -> None
         path.write_bytes(data)
         return
     if backend == "s3":
-        cfg = s3_settings()
-        s3_client().put_object(Bucket=cfg["bucket"], Key=key, Body=data, ContentType=media_type)
+        object_storage().put(key, data, media_type=media_type)
         return
     raise RuntimeError(f"Unsupported storage backend: {backend}")
 
@@ -319,9 +293,7 @@ def read_asset(page: dict[str, Any]) -> bytes:
             raise FileNotFoundError(str(path))
         return path.read_bytes()
     if backend == "s3":
-        cfg = s3_settings()
-        obj = s3_client().get_object(Bucket=cfg["bucket"], Key=key)
-        return obj["Body"].read()
+        return object_storage().read(key)
     raise FileNotFoundError(f"Unknown storage backend: {backend}")
 
 
@@ -338,10 +310,32 @@ def delete_asset(page: dict[str, Any]) -> None:
         return
     if backend == "s3" and s3_configured():
         try:
-            cfg = s3_settings()
-            s3_client().delete_object(Bucket=cfg["bucket"], Key=key)
+            object_storage().delete(key)
         except Exception:
             pass
+
+
+def proxy_content_url(page: dict[str, Any]) -> str:
+    suffix = "render" if page["type"] == "html" else "file"
+    return f'/api/pages/{page["id"]}/{suffix}'
+
+
+def page_to_api(page: dict[str, Any]) -> dict[str, Any]:
+    item = dict(page)
+    settings = object_storage_settings()
+    if item["storage_backend"] != "s3" or not settings.direct_read:
+        item["content_url"] = proxy_content_url(item)
+        item["content_url_expires_at"] = None
+        return item
+    try:
+        signed = object_storage().presign_get(item["storage_key"])
+    except ObjectStorageConfigurationError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, "Failed to create an object storage access URL") from exc
+    item["content_url"] = signed.url
+    item["content_url_expires_at"] = signed.expires_at
+    return item
 
 
 class LoginRequest(BaseModel):
@@ -424,7 +418,7 @@ def player(request: Request, project_id: str):
 
 @app.get("/api/config")
 def api_config():
-    cfg = s3_settings()
+    cfg = object_storage_settings()
     return {
         "storage_backends": ["local", "s3"] if s3_configured() else ["local"],
         "default_storage_backend": "s3" if s3_configured() else "local",
@@ -436,8 +430,12 @@ def api_config():
         },
         "s3": {
             "configured": s3_configured(),
-            "bucket": cfg["bucket"] if s3_configured() else None,
-            "endpoint_url": cfg["endpoint_url"] if s3_configured() else None,
+            "provider": cfg.provider if s3_configured() else None,
+            "bucket": cfg.bucket if s3_configured() else None,
+            "endpoint_url": cfg.endpoint_url if s3_configured() else None,
+            "browser_endpoint_url": cfg.browser_endpoint_url if s3_configured() else None,
+            "direct_read": cfg.direct_read if s3_configured() else False,
+            "presign_ttl_seconds": cfg.presign_ttl_seconds if s3_configured() else None,
         },
     }
 
@@ -487,7 +485,7 @@ def api_project(project_id: str):
         interactions = conn.execute(
             "SELECT * FROM interactions WHERE project_id = ? ORDER BY created_at", (project_id,)
         ).fetchall()
-    project["pages"] = [row_to_dict(r) for r in pages]
+    project["pages"] = [page_to_api(row_to_dict(r)) for r in pages]
     parsed: list[dict[str, Any]] = []
     for row in interactions:
         item = row_to_dict(row)
@@ -567,6 +565,9 @@ async def api_upload_pages(
                 raise HTTPException(413, f'{item["filename"]} is too large')
             page_id = str(uuid.uuid4())
             media_type = item["upload"].content_type or mimetypes.guess_type(item["filename"])[0] or "application/octet-stream"
+            if item["type"] == "html":
+                data = prepare_html_asset(page_id, data)
+                media_type = "text/html; charset=utf-8"
             key = asset_key(project_id, page_id, item["ext"], backend)
             store_asset(backend=backend, key=key, data=data, media_type=media_type)
             stored.append({**item, "id": page_id, "key": key, "backend": backend})
@@ -638,11 +639,22 @@ def api_delete_page(page_id: str):
     return {"ok": True}
 
 
+@app.get("/api/pages/{page_id}/content-url")
+def api_page_content_url(page_id: str):
+    page = page_to_api(get_page(page_id))
+    return {
+        "content_url": page["content_url"],
+        "content_url_expires_at": page["content_url_expires_at"],
+    }
+
+
 @app.get("/api/pages/{page_id}/file")
 def api_page_file(page_id: str):
     page = get_page(page_id)
     if page["type"] != "image":
         raise HTTPException(400, "Not an image page")
+    if page["storage_backend"] == "s3" and object_storage_settings().direct_read:
+        return RedirectResponse(page_to_api(page)["content_url"], status_code=307)
     try:
         content = read_asset(page)
     except FileNotFoundError:
@@ -654,20 +666,18 @@ def api_page_file(page_id: str):
     return Response(content=content, media_type=media_type, headers={"Cache-Control": "private, max-age=60"})
 
 
-def injected_html(page_id: str, source: str, mode: str) -> str:
+def instrument_html(page_id: str, source: str) -> str:
     source = re.sub(
         r"<meta[^>]+http-equiv=[\"']?Content-Security-Policy[\"']?[^>]*>",
         "",
         source,
         flags=re.IGNORECASE,
     )
-    edit_mode = mode == "edit"
     css = """
 <style id="__uipm_style">
 html,body{min-height:100%;}
 [data-ui-id]{cursor:pointer!important;}
-""" + ("""
-[data-ui-id]:hover{outline:2px solid #2563eb!important;outline-offset:2px!important;}
+html[data-uipm-mode="edit"] [data-ui-id]:hover{outline:2px solid #2563eb!important;outline-offset:2px!important;}
 #__uipm_overlay_root{position:fixed;inset:0;z-index:2147483646;pointer-events:none;overflow:visible;}
 .__uipm_marker{position:absolute;border:1px solid rgba(37,99,235,.72);border-radius:4px;background:rgba(37,99,235,.08);box-sizing:border-box;pointer-events:none;}
 .__uipm_marker.__uipm_hovered{border-color:#2563eb;background:rgba(37,99,235,.14);}
@@ -675,13 +685,16 @@ html,body{min-height:100%;}
 .__uipm_marker.__uipm_draft{border-style:dashed;}
 .__uipm_marker_label{position:absolute;left:-1px;top:-22px;max-width:240px;padding:3px 6px;border-radius:4px;background:#2563eb;color:#fff;font:600 11px/1.35 Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;box-shadow:0 2px 8px rgba(29,78,216,.24);}
 .__uipm_marker.__uipm_label_below .__uipm_marker_label{top:auto;bottom:-22px;}
-""" if edit_mode else "") + "</style>"
+</style>"""
 
     script = r"""
 <script id="__uipm_script">
 (() => {
   const PAGE_ID = __PAGE_ID__;
-  const EDIT_MODE = __EDIT_MODE__;
+  const hashMode = new URLSearchParams(location.hash.slice(1)).get('uipm-mode');
+  const queryMode = new URLSearchParams(location.search).get('mode');
+  const EDIT_MODE = (hashMode || queryMode) === 'edit';
+  document.documentElement.dataset.uipmMode = EDIT_MODE ? 'edit' : 'play';
   const IGNORED_TAGS = new Set(['SCRIPT', 'STYLE', 'LINK', 'META', 'TITLE', 'BASE', 'NOSCRIPT']);
   const SEMANTIC_SELECTOR = 'a,button,input,select,textarea,label,[role="button"],[onclick]';
   const editorState = {interactions: [], selectedInteractionId: null, hoveredInteractionId: null, draft: null};
@@ -915,6 +928,7 @@ html,body{min-height:100%;}
       });
       mutationObserver.observe(document.body, {subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'style', 'hidden']});
     }
+    window.parent.postMessage({type: 'uipm-content-ready', pageId: PAGE_ID}, '*');
     if (EDIT_MODE) window.parent.postMessage({type: 'uipm-editor-ready', pageId: PAGE_ID}, '*');
   }
 
@@ -922,11 +936,24 @@ html,body{min-height:100%;}
 })();
 </script>
 """
-    script = script.replace("__PAGE_ID__", json.dumps(page_id)).replace("__EDIT_MODE__", json.dumps(edit_mode))
+    script = script.replace("__PAGE_ID__", json.dumps(page_id))
     injection = css + script
     if re.search(r"</body\s*>", source, flags=re.IGNORECASE):
         return re.sub(r"</body\s*>", lambda _m: injection + "</body>", source, count=1, flags=re.IGNORECASE)
     return source + injection
+
+
+def decode_html(raw: bytes) -> str:
+    for encoding in ("utf-8", "utf-8-sig", "gb18030", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def prepare_html_asset(page_id: str, raw: bytes) -> bytes:
+    return instrument_html(page_id, decode_html(raw)).encode("utf-8")
 
 
 @app.get("/api/pages/{page_id}/render", response_class=HTMLResponse)
@@ -936,22 +963,19 @@ def api_render_html(page_id: str, mode: str = "edit"):
         raise HTTPException(400, "Not an HTML page")
     if mode not in {"edit", "play"}:
         mode = "edit"
+    if page["storage_backend"] == "s3" and object_storage_settings().direct_read:
+        target = page_to_api(page)["content_url"] + f"#uipm-mode={mode}"
+        return RedirectResponse(target, status_code=307)
     try:
         raw = read_asset(page)
     except FileNotFoundError:
         raise HTTPException(404, "Asset not found")
     except Exception as exc:
         raise HTTPException(502, f"Failed to read asset: {exc}") from exc
-    text = None
-    for encoding in ("utf-8", "utf-8-sig", "gb18030", "latin-1"):
-        try:
-            text = raw.decode(encoding)
-            break
-        except UnicodeDecodeError:
-            continue
-    if text is None:
-        text = raw.decode("utf-8", errors="replace")
-    return HTMLResponse(injected_html(page_id, text, mode), headers={"Cache-Control": "no-store"})
+    return HTMLResponse(
+        raw.decode("utf-8", errors="replace"),
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 def normalize_interaction_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1083,7 +1107,14 @@ def api_delete_interaction(interaction_id: str):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "db": str(DB_PATH), "s3_configured": s3_configured()}
+    settings = object_storage_settings()
+    return {
+        "ok": True,
+        "db": str(DB_PATH),
+        "s3_configured": settings.configured,
+        "storage_provider": settings.provider if settings.configured else None,
+        "direct_read": settings.direct_read if settings.configured else False,
+    }
 
 
 def main() -> None:

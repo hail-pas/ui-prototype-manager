@@ -120,19 +120,20 @@ class InteractionUpdateTests(unittest.TestCase):
 
 
 class InjectedEditorTests(unittest.TestCase):
-    def test_edit_mode_contains_bidirectional_overlay_protocol(self) -> None:
-        rendered = main.injected_html("page-1", "<body><button>Open</button></body>", "edit")
+    def test_static_document_contains_bidirectional_overlay_protocol(self) -> None:
+        rendered = main.instrument_html("page-1", "<body><button>Open</button></body>")
 
         self.assertIn("uipm-editor-state", rendered)
         self.assertIn("uipm-overlay-status", rendered)
         self.assertIn("__uipm_overlay_root", rendered)
         self.assertIn("uipm-element-hover", rendered)
 
-    def test_play_mode_does_not_render_editor_overlay(self) -> None:
-        rendered = main.injected_html("page-1", "<body><button>Open</button></body>", "play")
-        injected_style = rendered.split('<style id="__uipm_style">', 1)[1].split("</style>", 1)[0]
+    def test_mode_is_selected_by_url_at_runtime(self) -> None:
+        rendered = main.instrument_html("page-1", "<body><button>Open</button></body>")
 
-        self.assertNotIn("#__uipm_overlay_root", injected_style)
+        self.assertIn("location.hash.slice(1)", rendered)
+        self.assertIn("const EDIT_MODE = (hashMode || queryMode) === 'edit'", rendered)
+        self.assertIn('html[data-uipm-mode="edit"] [data-ui-id]:hover', rendered)
         self.assertIn("uipm-element-click", rendered)
 
 

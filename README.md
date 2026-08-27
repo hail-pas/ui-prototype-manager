@@ -1,4 +1,4 @@
-# UI Prototype Manager v0.4.0
+# UI Prototype Manager v0.5.0
 
 极简、本地可部署的交互 UI 页面管理器。使用 **uv + FastAPI + SQLite**，支持 HTML / 图片页面、页面跳转与真实返回交互、本地/S3资源存储和密钥访问控制。
 
@@ -7,6 +7,7 @@
 - 项目创建 / 删除
 - HTML、PNG/JPG/WebP/GIF 单个或批量上传
 - 每次上传可选择 **本地** 或 **S3-compatible** 存储
+- S3/OSS 页面通过私有对象的短期预签名 URL 由浏览器直读，不占用应用服务器下载带宽
 - 上传前可逐个修改 HTML / 图片名称，创建后可继续重命名
 - 同一项目内 **HTML + 图片名称唯一**，大小写不敏感
 - HTML：点击 DOM 元素创建交互
@@ -24,7 +25,7 @@
 - **全站密钥登录**：通过后浏览器保存 HttpOnly Token Cookie 24 小时
 - SQLite 元数据 + 本地持久化目录
 
-> v0.4.0 不提供旧数据兼容迁移。请直接删除旧 `data/` 后重新启动。
+> v0.5.0 不提供旧数据兼容迁移。请直接删除旧 `data/` 后重新启动。
 
 ## 1. 本地启动
 
@@ -145,21 +146,63 @@ docker run --rm -p 8080:8080 \
   uipm
 ```
 
-## 4. S3-compatible 存储
+## 4. S3-compatible / 阿里云 OSS 存储
 
-不配置 S3 时，上传界面只提供“本地”。配置后，同一项目可混用本地和 S3。
+不配置对象存储时，上传界面只提供“本地”。配置后，同一项目可混用本地和对象存储页面。
+
+对象存储页面由项目 API 返回短期预签名 URL，浏览器直接从存储服务读取 HTML/图片；应用服务器不再中转资源内容。签名有效期内，同一对象复用同一 URL 以命中浏览器缓存，并在到期前自动刷新。HTML 在上传时完成一次性交互脚本注入，S3/OSS 中保存的就是最终可展示文件。
+
+### 通用 S3-compatible
 
 ```bash
+export UIPM_S3_PROVIDER=s3
 export UIPM_S3_BUCKET=my-bucket
 export UIPM_S3_REGION=us-east-1
 export UIPM_S3_ACCESS_KEY_ID=xxx
 export UIPM_S3_SECRET_ACCESS_KEY=xxx
 
-# AWS S3 可不配置 endpoint；MinIO / R2 等按实际填写
-export UIPM_S3_ENDPOINT_URL=http://127.0.0.1:9000
+# AWS S3 可不配置 endpoint；MinIO / R2 等按实际填写。
+export UIPM_S3_ENDPOINT_URL=http://minio:9000
+# 必须是用户浏览器可以访问的地址；与内部地址相同时可以不填。
+export UIPM_S3_BROWSER_ENDPOINT_URL=https://objects.example.com
 export UIPM_S3_PREFIX=uipm
-export UIPM_S3_ADDRESSING_STYLE=path
+export UIPM_S3_ADDRESSING_STYLE=auto
+export UIPM_S3_SIGNATURE_VERSION=s3v4
+export UIPM_S3_DIRECT_READ=true
+export UIPM_S3_PRESIGN_TTL_SECONDS=3600
 ```
+
+关闭 `UIPM_S3_DIRECT_READ` 后会回退为应用服务器读取对象并返回，可用于临时排障。
+
+### 阿里云 OSS（当前部署）
+
+OSS 使用原生 Python SDK 和 V4 签名。`cn-chengdu` 会自动推导公网 Endpoint `https://oss-cn-chengdu.aliyuncs.com`，无需配置 `UIPM_S3_ENDPOINT_URL` 或 `UIPM_S3_BROWSER_ENDPOINT_URL`：
+
+```bash
+export UIPM_S3_PROVIDER=oss
+export UIPM_S3_BUCKET=uipm
+export UIPM_S3_REGION=cn-chengdu
+export UIPM_S3_ACCESS_KEY_ID=xxx
+export UIPM_S3_SECRET_ACCESS_KEY=xxx
+```
+
+浏览器直读 OSS 还需要一个绑定到 `uipm` Bucket、已配置 HTTPS 证书的自定义域名：
+
+```bash
+export UIPM_OSS_CNAME=https://prototype.example.com
+```
+
+`UIPM_OSS_CNAME` 不是一个单独服务，不需要额外部署程序。它只是一个 DNS CNAME：把域名指向 `uipm.oss-cn-chengdu.aliyuncs.com`，再到 OSS 控制台完成域名绑定和 HTTPS 证书配置。成都属于中国内地地域，因此该域名还需要完成 ICP 备案。
+
+这里把自定义域名作为 OSS 直读的必填项：阿里云默认 Bucket 域名会强制下载文件，无法可靠地在 iframe 中展示 HTML；2025 年 3 月 20 日起，中国内地新 OSS 用户通过默认公网 Endpoint 访问数据 API 还会收到 `PublicEndpointForbidden`。参见阿里云官方的[自定义域名说明](https://www.alibabacloud.com/help/en/oss/user-guide/access-buckets-via-custom-domain-names)和[访问域名与网络说明](https://www.alibabacloud.com/help/en/oss/user-guide/access-and-network-overview)。缺少 `UIPM_OSS_CNAME` 时应用会在启动阶段给出明确配置错误，避免生成实际不可用的直读 URL。
+
+如果应用服务器也部署在阿里云成都地域，可选用内网 Endpoint 来节省上传流量；浏览器仍通过公网自定义域名读取：
+
+```bash
+export UIPM_S3_ENDPOINT_URL=https://oss-cn-chengdu-internal.aliyuncs.com
+```
+
+`UIPM_S3_PREFIX`、`UIPM_S3_DIRECT_READ`、`UIPM_S3_PRESIGN_TTL_SECONDS` 等均已有合理默认值，一般无需配置。`UIPM_S3_BROWSER_ENDPOINT_URL` 只保留给 MinIO、R2 等通用 S3-compatible 服务，OSS 不需要使用。
 
 对象 Key 使用稳定 UUID：
 
@@ -258,6 +301,6 @@ Project
 
 ## 9. 当前边界
 
-当前版本定位为可信本地/内网工具，暂不实现 HTML/CSS/JS 编辑、组件拖拽、页面排序、多人账号、复杂权限、版本控制、条件跳转、动画转场、跨项目跳转、S3 Bucket 自动创建。
+当前版本定位为可信本地/内网工具，只支持独立单 HTML 文件，不处理 HTML 引用的相对 CSS/JS/图片资源包；暂不实现 HTML/CSS/JS 编辑、组件拖拽、页面排序、多人账号、复杂权限、版本控制、条件跳转、动画转场、跨项目跳转、S3 Bucket 自动创建。
 
 上传 HTML 使用 `sandbox="allow-scripts"` iframe。如果未来允许不可信外部用户上传 HTML，建议增加独立资源域、HTML 清洗和更严格 CSP。

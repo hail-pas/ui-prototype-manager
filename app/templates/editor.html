@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{{ project.name }} · UI Prototype Manager</title>
-  <link rel="stylesheet" href="/static/app.css" />
+  <link rel="stylesheet" href="/static/app.css?v=20260827-upload-progress-2" />
 </head>
 <body class="editor-body">
   <div id="app" data-project-id="{{ project.id }}" class="editor-shell">
@@ -46,7 +46,7 @@
 
   <dialog id="uploadDialog" class="dialog upload-dialog">
     <form method="dialog" id="uploadForm">
-      <h2>确认上传页面</h2>
+      <h2 id="uploadDialogTitle">确认上传页面</h2>
       <p class="dialog-note">可在创建前修改每个页面名称；同一项目内 HTML 与图片名称必须唯一。</p>
       <div id="uploadRows" class="upload-name-list"></div>
       <details class="render-config-details">
@@ -66,7 +66,14 @@
           <p class="dialog-note">自动模式会在页面横向溢出时识别固定画布；宽高作为固定模式和自动识别的安全默认值。</p>
         </div>
       </details>
-      <div class="dialog-actions"><button type="button" id="uploadCancel" class="ghost-btn">取消</button><button type="submit" class="primary-btn">上传</button></div>
+      <div id="uploadStatus" class="upload-status" role="status" aria-live="polite" hidden>
+        <span class="upload-spinner" aria-hidden="true"></span>
+        <span class="upload-status-copy">
+          <strong id="uploadStatusTitle">正在上传并处理文件…</strong>
+          <span id="uploadStatusDetail">请保持当前页面打开 · 已耗时 0 秒</span>
+        </span>
+      </div>
+      <div class="dialog-actions"><button type="button" id="uploadCancel" class="ghost-btn">取消</button><button type="submit" id="uploadSubmit" class="primary-btn"><span class="upload-submit-spinner" aria-hidden="true"></span><span id="uploadSubmitLabel">上传</span></button></div>
     </form>
   </dialog>
 
@@ -84,6 +91,6 @@
   </dialog>
 
   <script src="/static/frame-fit.js"></script>
-  <script src="/static/editor.js"></script>
+  <script src="/static/editor.js?v=20260827-upload-progress-2"></script>
 </body>
 </html>
