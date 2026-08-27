@@ -173,6 +173,7 @@ function createPlayerOverlay(item) {
   });
   if (item.type === 'video') {
     media.autoplay = true;
+    media.loop = true;
     media.muted = true;
     media.defaultMuted = true;
     media.controls = Boolean(item.video_controls);

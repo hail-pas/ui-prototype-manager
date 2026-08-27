@@ -140,6 +140,16 @@ class InjectedEditorTests(unittest.TestCase):
         self.assertIn("uipm-element-click", rendered)
 
 
+class PlayerOverlayTests(unittest.TestCase):
+    def test_overlay_videos_are_configured_to_autoplay_and_loop(self) -> None:
+        player_script = (Path(main.__file__).parent / "static" / "player.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("media.autoplay = true;", player_script)
+        self.assertIn("media.loop = true;", player_script)
+
+
 class HtmlInstrumentationUpgradeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
