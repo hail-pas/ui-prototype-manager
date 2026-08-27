@@ -2,6 +2,7 @@ const root = document.getElementById('player');
 const projectId = root.dataset.projectId;
 const stage = document.getElementById('playerStage');
 const backBtn = document.getElementById('backBtn');
+const fullscreenBtn = document.getElementById('fullscreenBtn');
 const pageList = document.getElementById('playerPageList');
 const pageCount = document.getElementById('playerPageCount');
 const pageNameElement = document.getElementById('playerPageName');
@@ -66,6 +67,40 @@ function setMenuOpen(open) {
 
 function toggleMenu() {
   setMenuOpen(!menuOpen);
+}
+
+function setFullscreenButtonLabel(label) {
+  fullscreenBtn.textContent = label;
+}
+
+function syncFullscreenState() {
+  const active = document.fullscreenElement === root;
+  setFullscreenButtonLabel(active ? '退出全屏' : '进入全屏');
+  fullscreenBtn.setAttribute('aria-pressed', String(active));
+  frameController?.relayout();
+}
+
+async function toggleFullscreen() {
+  const active = document.fullscreenElement === root;
+  if (!active && (!document.fullscreenEnabled || typeof root.requestFullscreen !== 'function')) {
+    setFullscreenButtonLabel('当前浏览器不支持全屏');
+    fullscreenBtn.disabled = true;
+    return;
+  }
+
+  fullscreenBtn.disabled = true;
+  setFullscreenButtonLabel(active ? '正在退出全屏…' : '正在进入全屏…');
+  try {
+    if (active) await document.exitFullscreen();
+    else await root.requestFullscreen({navigationUI: 'hide'});
+    setMenuOpen(false);
+  } catch (error) {
+    console.warn(active ? '退出全屏失败' : '进入全屏失败', error);
+    setFullscreenButtonLabel(active ? '退出全屏失败，请重试' : '进入全屏失败，请重试');
+    window.setTimeout(syncFullscreenState, 1800);
+  } finally {
+    fullscreenBtn.disabled = false;
+  }
 }
 
 async function api(url) {
@@ -360,6 +395,8 @@ backBtn.addEventListener('click', () => {
   goBack();
   setMenuOpen(false);
 });
+fullscreenBtn.addEventListener('click', () => void toggleFullscreen());
+document.addEventListener('fullscreenchange', syncFullscreenState);
 menuCloseBtn.addEventListener('click', () => setMenuOpen(false));
 menuBackdrop.addEventListener('click', () => setMenuOpen(false));
 
