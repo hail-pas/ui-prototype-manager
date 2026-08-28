@@ -30,7 +30,9 @@
     let activeMode = requestedMode === 'fixed' ? 'fixed' : 'responsive';
     let designWidth = configuredWidth;
     let designHeight = configuredHeight;
+    let playerScale = 1;
     let destroyed = false;
+    const viewportLayers = new Set();
 
     const wrap = document.createElement('div');
     wrap.className = `html-frame-wrap ${variant === 'player' ? 'player-html-frame-wrap' : ''}`;
@@ -45,8 +47,39 @@
     wrap.appendChild(viewport);
     host.replaceChildren(wrap);
 
+    function layoutViewportLayers() {
+      viewportLayers.forEach((layer) => {
+        if (variant === 'player' && activeMode === 'fixed') {
+          Object.assign(layer.style, {
+            inset: 'auto',
+            left: '0',
+            top: '0',
+            right: 'auto',
+            bottom: 'auto',
+            width: `${designWidth}px`,
+            height: `${designHeight}px`,
+            transform: `scale(${playerScale})`,
+            transformOrigin: 'top left',
+          });
+          return;
+        }
+        Object.assign(layer.style, {
+          inset: '0',
+          left: '0',
+          top: '0',
+          right: '0',
+          bottom: '0',
+          width: '',
+          height: '',
+          transform: '',
+          transformOrigin: '',
+        });
+      });
+    }
+
     function layoutResponsive() {
       if (destroyed) return;
+      playerScale = 1;
       const available = availableSize(host);
       const outerWidth = variant === 'player'
         ? available.width
@@ -65,6 +98,7 @@
       iframe.style.width = '100%';
       iframe.style.height = '100%';
       iframe.style.transform = 'none';
+      layoutViewportLayers();
     }
 
     function layoutFixed() {
@@ -73,6 +107,7 @@
       if (variant === 'player') {
         // Keep the configured layout width stable while using every visible pixel.
         const scale = Math.max(0.01, available.width / designWidth);
+        playerScale = scale;
         const virtualHeight = Math.max(1, available.height / scale);
         wrap.classList.remove('is-responsive');
         wrap.classList.add('is-fixed');
@@ -84,8 +119,10 @@
         iframe.style.width = `${designWidth}px`;
         iframe.style.height = `${virtualHeight}px`;
         iframe.style.transform = `scale(${scale})`;
+        layoutViewportLayers();
         return;
       }
+      playerScale = 1;
       const innerAvailableWidth = Math.max(1, Math.min(available.width, maxWidth) - 2);
       const innerAvailableHeight = Math.max(1, available.height - 2);
       const scale = Math.max(0.01, Math.min(
@@ -105,6 +142,7 @@
       iframe.style.width = `${designWidth}px`;
       iframe.style.height = `${designHeight}px`;
       iframe.style.transform = `scale(${scale})`;
+      layoutViewportLayers();
     }
 
     function layout() {
@@ -140,6 +178,12 @@
       wrap,
       viewport,
       iframe,
+      attachViewportLayer(layer) {
+        if (destroyed || !layer) return;
+        viewportLayers.add(layer);
+        viewport.appendChild(layer);
+        layoutViewportLayers();
+      },
       ownsMessage(event) { return event.source === iframe.contentWindow; },
       send(message) {
         if (!destroyed && iframe.contentWindow) iframe.contentWindow.postMessage(message, '*');
@@ -148,6 +192,7 @@
       destroy() {
         if (destroyed) return;
         destroyed = true;
+        viewportLayers.clear();
         window.removeEventListener('message', handleMessage);
         if (resizeObserver) resizeObserver.disconnect(); else window.removeEventListener('resize', layout);
       },

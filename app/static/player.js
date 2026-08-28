@@ -198,11 +198,15 @@ function createPlayerOverlay(item) {
   return media;
 }
 
-function renderPlayerOverlays(container, pageId) {
+function createPlayerOverlayLayer(pageId) {
   const layer = document.createElement('div');
   layer.className = 'overlay-layer player-overlay-layer';
   layer.replaceChildren(...overlays(pageId).map(createPlayerOverlay));
-  container.appendChild(layer);
+  return layer;
+}
+
+function renderPlayerOverlays(container, pageId) {
+  container.appendChild(createPlayerOverlayLayer(pageId));
 }
 
 async function load() {
@@ -314,7 +318,7 @@ async function render() {
       viewportWidth: currentPage.viewport_width || 1920,
       viewportHeight: currentPage.viewport_height || 1080,
     });
-    renderPlayerOverlays(frameController.viewport, currentPage.id);
+    frameController.attachViewportLayer(createPlayerOverlayLayer(currentPage.id));
     return;
   }
 
