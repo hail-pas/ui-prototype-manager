@@ -149,6 +149,19 @@ class PlayerOverlayTests(unittest.TestCase):
         self.assertIn("media.autoplay = true;", player_script)
         self.assertIn("media.loop = true;", player_script)
 
+    def test_page_transition_waits_for_base_content_and_overlays(self) -> None:
+        player_script = (Path(main.__file__).parent / "static" / "player.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "Promise.all([contentReady.promise, frameLoaded.promise, overlay.ready])",
+            player_script,
+        )
+        self.assertIn("Promise.all([loadBaseImage(), overlay.ready])", player_script)
+        self.assertIn("await afterStablePaint(signal);", player_script)
+        self.assertNotIn("stage.innerHTML =", player_script)
+
 
 class HtmlInstrumentationUpgradeTests(unittest.TestCase):
     def setUp(self) -> None:

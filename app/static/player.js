@@ -10,13 +10,24 @@ const menuLayer = document.getElementById('playerMenuLayer');
 const menuBackdrop = document.getElementById('playerMenuBackdrop');
 const menuCloseBtn = document.getElementById('menuCloseBtn');
 
+const PAGE_READY_TIMEOUT_MS = 15_000;
+const PAGE_LOADING_DELAY_MS = 250;
+const PAGE_ERROR_VISIBLE_MS = 5_000;
+const PAGE_TRANSITION_MS = 140;
+const PAGE_CACHE_TTL_MS = 30_000;
+
 let state = {pages: [], interactions: [], overlays: []};
-let historyStack = [];
 let currentPageId = null;
-let frameController = null;
-let renderVersion = 0;
+let activeView = null;
+let cachedView = null;
+let cachedViewTimer = null;
+let navigation = null;
 let menuOpen = false;
 let previewFocusTarget = null;
+let transitionStatus = null;
+let transitionStatusTimer = null;
+let transitionStatusHideTimer = null;
+const pageViews = new Set();
 const contentUrlRefreshes = new Map();
 
 function esc(value = '') {
@@ -46,7 +57,7 @@ function focusableMenuElements() {
 
 function restorePreviewFocus() {
   requestAnimationFrame(() => {
-    const target = frameController?.iframe || previewFocusTarget || stage;
+    const target = activeView?.controller?.iframe || previewFocusTarget || stage;
     if (target?.isConnected) target.focus({preventScroll: true});
     previewFocusTarget = null;
   });
@@ -77,7 +88,7 @@ function syncFullscreenState() {
   const active = document.fullscreenElement === root;
   setFullscreenButtonLabel(active ? '退出全屏' : '进入全屏');
   fullscreenBtn.setAttribute('aria-pressed', String(active));
-  frameController?.relayout();
+  pageViews.forEach((view) => view.controller?.relayout());
 }
 
 async function toggleFullscreen() {
@@ -160,7 +171,94 @@ async function refreshOverlayContentUrl(item) {
   await contentUrlRefreshes.get(refreshKey);
 }
 
-function createPlayerOverlay(item) {
+function abortError() {
+  return new DOMException('Navigation cancelled', 'AbortError');
+}
+
+function throwIfAborted(signal) {
+  if (signal.aborted) throw abortError();
+}
+
+function abortable(promise, signal) {
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise((resolve, reject) => {
+    const handleAbort = () => reject(abortError());
+    signal.addEventListener('abort', handleAbort, {once: true});
+    Promise.resolve(promise).then(
+      (value) => {
+        signal.removeEventListener('abort', handleAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', handleAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+function withTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => window.clearTimeout(timer));
+}
+
+function afterStablePaint(signal) {
+  return abortable(new Promise((resolve) => {
+    requestAnimationFrame(() => requestAnimationFrame(resolve));
+  }), signal);
+}
+
+function waitForMedia(media, readyEvent, isReady, signal) {
+  if (signal.aborted) return Promise.reject(abortError());
+  if (isReady()) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      media.removeEventListener(readyEvent, handleReady);
+      media.removeEventListener('error', handleError);
+      signal.removeEventListener('abort', handleAbort);
+    };
+    const handleReady = () => {
+      cleanup();
+      resolve();
+    };
+    const handleError = () => {
+      cleanup();
+      reject(new Error('媒体资源加载失败'));
+    };
+    const handleAbort = () => {
+      cleanup();
+      reject(abortError());
+    };
+    media.addEventListener(readyEvent, handleReady, {once: true});
+    media.addEventListener('error', handleError, {once: true});
+    signal.addEventListener('abort', handleAbort, {once: true});
+  });
+}
+
+async function loadImageMedia(image, url, signal) {
+  image.src = url;
+  await waitForMedia(
+    image,
+    'load',
+    () => image.complete && image.naturalWidth > 0,
+    signal,
+  );
+  if (typeof image.decode === 'function') {
+    await abortable(image.decode().catch(() => {}), signal);
+  }
+}
+
+async function loadVideoMedia(video, url, signal) {
+  video.src = url;
+  await waitForMedia(video, 'loadeddata', () => video.readyState >= 2, signal);
+  const playback = video.play();
+  if (playback) playback.catch(() => {});
+}
+
+function createPlayerOverlay(item, signal) {
   const media = document.createElement(item.type === 'video' ? 'video' : 'img');
   media.className = `player-overlay is-${item.type}`;
   media.draggable = false;
@@ -178,168 +276,95 @@ function createPlayerOverlay(item) {
     media.defaultMuted = true;
     media.controls = Boolean(item.video_controls);
     media.playsInline = true;
-    media.preload = 'metadata';
-    media.addEventListener('canplay', () => {
-      const playback = media.play();
-      if (playback) playback.catch(() => {});
-    }, {once: true});
+    media.preload = 'auto';
   } else {
     media.alt = '';
+    media.decoding = 'async';
   }
-  media.src = overlayContentUrl(item);
-  media.addEventListener('error', async () => {
-    if (media.dataset.contentUrlRetried === 'true') return;
-    media.dataset.contentUrlRetried = 'true';
+
+  const load = async () => {
+    const loadSource = () => item.type === 'video'
+      ? loadVideoMedia(media, overlayContentUrl(item), signal)
+      : loadImageMedia(media, overlayContentUrl(item), signal);
     try {
-      await refreshOverlayContentUrl(item);
-      if (item.page_id === currentPageId && media.isConnected) media.src = overlayContentUrl(item);
-    } catch {}
-  });
-  return media;
+      await loadSource();
+    } catch (error) {
+      if (signal.aborted) throw error;
+      await abortable(refreshOverlayContentUrl(item), signal);
+      await loadSource();
+    }
+  };
+  return {media, ready: load()};
 }
 
-function createPlayerOverlayLayer(pageId) {
+function createPlayerOverlayLayer(pageId, signal) {
   const layer = document.createElement('div');
   layer.className = 'overlay-layer player-overlay-layer';
-  layer.replaceChildren(...overlays(pageId).map(createPlayerOverlay));
-  return layer;
+  const mediaItems = overlays(pageId).map((item) => createPlayerOverlay(item, signal));
+  layer.replaceChildren(...mediaItems.map((item) => item.media));
+  return {
+    layer,
+    ready: Promise.all(mediaItems.map((item) => item.ready)),
+  };
 }
 
-function renderPlayerOverlays(container, pageId) {
-  container.appendChild(createPlayerOverlayLayer(pageId));
+function createPageLayer(item) {
+  const element = document.createElement('div');
+  element.className = `player-page-view is-preparing ${item.type === 'image' ? 'is-image-view' : 'is-html-view'}`;
+  element.dataset.pageId = item.id;
+  element.inert = true;
+  element.setAttribute('aria-hidden', 'true');
+  stage.appendChild(element);
+  return element;
 }
 
-async function load() {
-  try {
-    state = await api(`/api/projects/${projectId}`);
-    state.overlays = Array.isArray(state.overlays) ? state.overlays : [];
-  } catch (error) {
-    stage.innerHTML = `<div class="player-empty">${esc(error.message)}</div>`;
-    return;
-  }
-  const requestedPageId = new URLSearchParams(location.search).get('page');
-  currentPageId = state.pages.some((item) => item.id === requestedPageId)
-    ? requestedPageId
-    : state.pages[0]?.id || null;
-  if (currentPageId) historyStack = [currentPageId];
-  pageCount.textContent = state.pages.length;
-  void render();
-}
-
-function updateUrl(pageId) {
-  const url = new URL(location.href);
-  if (pageId) url.searchParams.set('page', pageId);
-  else url.searchParams.delete('page');
-  history.replaceState(null, '', url);
-}
-
-function navigate(pageId) {
-  if (!state.pages.some((item) => item.id === pageId) || pageId === currentPageId) return;
-  currentPageId = pageId;
-  historyStack.push(pageId);
-  updateUrl(pageId);
-  void render();
-}
-
-function goBack() {
-  if (historyStack.length <= 1) return;
-  historyStack.pop();
-  currentPageId = historyStack[historyStack.length - 1];
-  updateUrl(currentPageId);
-  void render();
-}
-
-function executeInteraction(interaction) {
-  if (!interaction) return;
-  if (interaction.action === 'back') {
-    goBack();
-    return;
-  }
-  if (interaction.action === 'navigate' && interaction.target_page_id) {
-    navigate(interaction.target_page_id);
-  }
-}
-
-function renderPageList() {
-  if (!state.pages.length) {
-    pageList.innerHTML = '<div class="player-nav-empty">暂无页面</div>';
-    return;
-  }
-  pageList.innerHTML = state.pages.map((item) => `
-    <button type="button" class="player-page-item ${item.id === currentPageId ? 'active' : ''}" data-id="${item.id}">
-      <span class="player-page-type">${item.type === 'html' ? 'HTML' : 'IMG'}</span>
-      <span class="player-page-name">${esc(item.name)}</span>
-    </button>`).join('');
-  pageList.querySelectorAll('.player-page-item').forEach((button) => {
-    button.addEventListener('click', () => {
-      navigate(button.dataset.id);
-      setMenuOpen(false);
-    });
+function createReadySignal() {
+  let settled = false;
+  let resolveReady;
+  const promise = new Promise((resolve) => {
+    resolveReady = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
   });
+  return {promise, resolve: resolveReady};
 }
 
-async function render() {
-  const currentRenderVersion = ++renderVersion;
-  if (frameController) {
-    frameController.destroy();
-    frameController = null;
-  }
-  backBtn.disabled = historyStack.length <= 1;
-  const currentPage = page(currentPageId);
-  pageNameElement.textContent = currentPage?.name || '';
-  stage.classList.toggle('is-image-page', currentPage?.type === 'image');
-  renderPageList();
-  if (!currentPage) {
-    stage.innerHTML = '<div class="player-empty">项目还没有页面。</div>';
-    return;
-  }
+function createHtmlPageView(item, signal) {
+  const element = createPageLayer(item);
+  const contentReady = createReadySignal();
+  const frameLoaded = createReadySignal();
+  const overlay = createPlayerOverlayLayer(item.id, signal);
+  const view = {
+    controller: null,
+    destroyed: false,
+    element,
+    markContentReady: contentReady.resolve,
+    pageId: item.id,
+    ready: null,
+    returnToCacheOnDiscard: false,
+  };
 
-  if (contentUrlExpiring(currentPage)) {
-    stage.innerHTML = '<div class="player-empty">正在刷新资源访问地址…</div>';
-    try {
-      await refreshPageContentUrl(currentPage);
-    } catch (error) {
-      if (currentRenderVersion === renderVersion) {
-        stage.innerHTML = `<div class="player-empty">${esc(error.message)}</div>`;
-      }
-      return;
-    }
-    if (currentRenderVersion !== renderVersion || currentPage.id !== currentPageId) return;
-  }
-
-  if (currentPage.type === 'html') {
-    frameController = window.UIPMFrameFit.create({
-      host: stage,
-      pageId: currentPage.id,
-      title: currentPage.name,
-      src: pageContentUrl(currentPage, 'play'),
-      variant: 'player',
-      renderMode: currentPage.render_mode || 'auto',
-      viewportWidth: currentPage.viewport_width || 1920,
-      viewportHeight: currentPage.viewport_height || 1080,
-    });
-    frameController.attachViewportLayer(createPlayerOverlayLayer(currentPage.id));
-    return;
-  }
-
-  stage.innerHTML = `
-    <div id="playImageStage" class="player-image-stage">
-      <img id="playerPageImage" src="${esc(pageContentUrl(currentPage))}" alt="${esc(currentPage.name)}">
-    </div>`;
-  const imageStage = document.getElementById('playImageStage');
-  const image = document.getElementById('playerPageImage');
-  image.addEventListener('error', async () => {
-    if (image.dataset.contentUrlRetried === 'true') return;
-    image.dataset.contentUrlRetried = 'true';
-    try {
-      await refreshPageContentUrl(currentPage);
-      if (currentPage.id === currentPageId) image.src = pageContentUrl(currentPage);
-    } catch (error) {
-      stage.innerHTML = `<div class="player-empty">${esc(error.message)}</div>`;
-    }
+  view.controller = window.UIPMFrameFit.create({
+    host: element,
+    pageId: item.id,
+    title: item.name,
+    src: pageContentUrl(item, 'play'),
+    variant: 'player',
+    renderMode: item.render_mode || 'auto',
+    viewportWidth: item.viewport_width || 1920,
+    viewportHeight: item.viewport_height || 1080,
   });
-  renderPlayerOverlays(imageStage, currentPage.id);
-  interactions(currentPage.id).filter((item) => item.kind === 'region').forEach((interaction) => {
+  view.controller.iframe.addEventListener('load', frameLoaded.resolve, {once: true});
+  view.controller.attachViewportLayer(overlay.layer);
+  view.ready = Promise.all([contentReady.promise, frameLoaded.promise, overlay.ready]);
+  pageViews.add(view);
+  return view;
+}
+
+function appendImageHotspots(container, pageId) {
+  interactions(pageId).filter((item) => item.kind === 'region').forEach((interaction) => {
     const region = interaction.payload;
     const hotspot = document.createElement('button');
     hotspot.className = 'player-hotspot';
@@ -354,13 +379,346 @@ async function render() {
       height: `${region.height * 100}%`,
     });
     hotspot.addEventListener('click', () => executeInteraction(interaction));
-    imageStage.appendChild(hotspot);
+    container.appendChild(hotspot);
   });
+}
+
+function createImagePageView(item, signal) {
+  const element = createPageLayer(item);
+  const imageStage = document.createElement('div');
+  imageStage.className = 'player-image-stage';
+  const image = document.createElement('img');
+  image.alt = item.name;
+  image.decoding = 'async';
+  imageStage.appendChild(image);
+  const overlay = createPlayerOverlayLayer(item.id, signal);
+  imageStage.appendChild(overlay.layer);
+  appendImageHotspots(imageStage, item.id);
+  element.appendChild(imageStage);
+
+  const loadBaseImage = async () => {
+    try {
+      await loadImageMedia(image, pageContentUrl(item), signal);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      await abortable(refreshPageContentUrl(item), signal);
+      await loadImageMedia(image, pageContentUrl(item), signal);
+    }
+  };
+  const view = {
+    controller: null,
+    destroyed: false,
+    element,
+    markContentReady: null,
+    pageId: item.id,
+    ready: Promise.all([loadBaseImage(), overlay.ready]),
+    returnToCacheOnDiscard: false,
+  };
+  pageViews.add(view);
+  return view;
+}
+
+function destroyPageView(view) {
+  if (!view || view.destroyed) return;
+  view.destroyed = true;
+  view.abortController?.abort();
+  view.controller?.destroy();
+  view.element.querySelectorAll('video, audio').forEach((media) => {
+    media.pause();
+    media.removeAttribute('src');
+    media.load?.();
+  });
+  view.element.remove();
+  pageViews.delete(view);
+  if (cachedView === view) cachedView = null;
+}
+
+function pauseViewMedia(view) {
+  view.element.querySelectorAll('video, audio').forEach((media) => media.pause());
+}
+
+function resumeViewMedia(view) {
+  view.element.querySelectorAll('video[autoplay], audio[autoplay]').forEach((media) => {
+    const playback = media.play();
+    if (playback) playback.catch(() => {});
+  });
+}
+
+function storeCachedView(view) {
+  if (!view || view === activeView || view.destroyed) return;
+  if (cachedView && cachedView !== view) destroyPageView(cachedView);
+  window.clearTimeout(cachedViewTimer);
+  view.returnToCacheOnDiscard = false;
+  view.element.classList.remove('is-active', 'is-leaving', 'is-faded');
+  view.element.classList.add('is-preparing', 'is-cached');
+  view.element.inert = true;
+  view.element.setAttribute('aria-hidden', 'true');
+  pauseViewMedia(view);
+  cachedView = view;
+  cachedViewTimer = window.setTimeout(() => {
+    if (cachedView === view) destroyPageView(view);
+  }, PAGE_CACHE_TTL_MS);
+}
+
+async function takeCachedView(pageId, signal) {
+  if (!cachedView || cachedView.pageId !== pageId) return null;
+  const view = cachedView;
+  cachedView = null;
+  window.clearTimeout(cachedViewTimer);
+  view.returnToCacheOnDiscard = true;
+  view.element.classList.remove('is-cached');
+  view.controller?.relayout();
+  resumeViewMedia(view);
+  try {
+    await afterStablePaint(signal);
+    return view;
+  } catch (error) {
+    storeCachedView(view);
+    throw error;
+  }
+}
+
+async function preparePageView(pageId, signal) {
+  const item = page(pageId);
+  if (!item) throw new Error('目标页面不存在');
+  const cached = await takeCachedView(pageId, signal);
+  if (cached) return cached;
+
+  throwIfAborted(signal);
+  if (contentUrlExpiring(item)) await abortable(refreshPageContentUrl(item), signal);
+  throwIfAborted(signal);
+  const viewAbortController = new AbortController();
+  const relayAbort = () => viewAbortController.abort();
+  signal.addEventListener('abort', relayAbort, {once: true});
+  const view = item.type === 'html'
+    ? createHtmlPageView(item, viewAbortController.signal)
+    : createImagePageView(item, viewAbortController.signal);
+  view.abortController = viewAbortController;
+  try {
+    await withTimeout(
+      abortable(view.ready, signal),
+      PAGE_READY_TIMEOUT_MS,
+      `“${item.name}”加载超时`,
+    );
+    await afterStablePaint(signal);
+    return view;
+  } catch (error) {
+    destroyPageView(view);
+    throw error;
+  } finally {
+    signal.removeEventListener('abort', relayAbort);
+  }
+}
+
+function activatePageView(view) {
+  stage.classList.add('has-active-page');
+  view.returnToCacheOnDiscard = false;
+  view.element.classList.remove('is-preparing', 'is-cached', 'is-leaving', 'is-faded');
+  view.element.classList.add('is-active');
+  view.element.inert = false;
+  view.element.setAttribute('aria-hidden', 'false');
+  view.controller?.relayout();
+  resumeViewMedia(view);
+}
+
+function commitPageView(view) {
+  const outgoing = activeView;
+  activeView = view;
+  activatePageView(view);
+  removeInitialEmpty();
+  if (!outgoing || outgoing === view) return;
+
+  if (outgoing.element.contains(document.activeElement)) {
+    const focusTarget = view.controller?.iframe || stage;
+    focusTarget.focus({preventScroll: true});
+  }
+  outgoing.element.inert = true;
+  outgoing.element.setAttribute('aria-hidden', 'true');
+  outgoing.element.classList.remove('is-active');
+  outgoing.element.classList.add('is-leaving');
+  requestAnimationFrame(() => {
+    if (outgoing.destroyed || outgoing === activeView) return;
+    outgoing.element.classList.add('is-faded');
+    window.setTimeout(() => {
+      if (outgoing !== activeView) storeCachedView(outgoing);
+    }, PAGE_TRANSITION_MS);
+  });
+}
+
+function discardPageView(view) {
+  if (view?.returnToCacheOnDiscard) storeCachedView(view);
+  else destroyPageView(view);
+}
+
+function ensureTransitionStatus() {
+  if (transitionStatus) return transitionStatus;
+  transitionStatus = document.createElement('div');
+  transitionStatus.className = 'player-transition-status';
+  transitionStatus.hidden = true;
+  transitionStatus.setAttribute('role', 'status');
+  transitionStatus.setAttribute('aria-live', 'polite');
+  stage.appendChild(transitionStatus);
+  return transitionStatus;
+}
+
+function clearTransitionStatus() {
+  window.clearTimeout(transitionStatusTimer);
+  window.clearTimeout(transitionStatusHideTimer);
+  stage.removeAttribute('aria-busy');
+  if (!transitionStatus) return;
+  transitionStatus.hidden = true;
+  transitionStatus.classList.remove('is-error');
+  transitionStatus.textContent = '';
+}
+
+function beginTransitionStatus(request) {
+  clearTransitionStatus();
+  stage.setAttribute('aria-busy', 'true');
+  transitionStatusTimer = window.setTimeout(() => {
+    const item = page(request.pageId);
+    const status = ensureTransitionStatus();
+    status.textContent = `正在打开“${item?.name || '目标页面'}”…`;
+    status.hidden = false;
+  }, PAGE_LOADING_DELAY_MS);
+}
+
+function showTransitionError(error, request) {
+  clearTransitionStatus();
+  if (!activeView) {
+    showInitialEmpty(error?.message || '页面加载失败');
+    return;
+  }
+  const item = page(request.pageId);
+  const status = ensureTransitionStatus();
+  status.classList.add('is-error');
+  status.textContent = `“${item?.name || '目标页面'}”加载失败：${error?.message || '请重试'}`;
+  status.hidden = false;
+  transitionStatusHideTimer = window.setTimeout(clearTransitionStatus, PAGE_ERROR_VISIBLE_MS);
+}
+
+function showInitialEmpty(message) {
+  removeInitialEmpty();
+  const empty = document.createElement('div');
+  empty.className = 'player-empty player-initial-empty';
+  empty.textContent = message;
+  stage.appendChild(empty);
+}
+
+function removeInitialEmpty() {
+  stage.querySelector('.player-initial-empty')?.remove();
+}
+
+function updateUrl(pageId) {
+  const url = new URL(location.href);
+  if (pageId) url.searchParams.set('page', pageId);
+  else url.searchParams.delete('page');
+  history.replaceState(null, '', url);
+}
+
+function renderPageList(pendingPageId = null) {
+  if (!state.pages.length) {
+    pageList.innerHTML = '<div class="player-nav-empty">暂无页面</div>';
+    return;
+  }
+  pageList.innerHTML = state.pages.map((item) => `
+    <button type="button" class="player-page-item ${item.id === currentPageId ? 'active' : ''} ${item.id === pendingPageId ? 'pending' : ''}" data-id="${item.id}">
+      <span class="player-page-type">${item.type === 'html' ? 'HTML' : 'IMG'}</span>
+      <span class="player-page-name">${esc(item.name)}</span>
+    </button>`).join('');
+  pageList.querySelectorAll('.player-page-item').forEach((button) => {
+    button.addEventListener('click', () => {
+      navigate(button.dataset.id);
+      setMenuOpen(false);
+    });
+  });
+}
+
+function syncNavigationState(snapshot) {
+  currentPageId = snapshot.currentPageId;
+  backBtn.disabled = snapshot.historyStack.length <= 1 && !(snapshot.pendingPageId && activeView);
+  renderPageList(snapshot.pendingPageId);
+}
+
+function handleNavigationCommit(snapshot) {
+  currentPageId = snapshot.currentPageId;
+  const current = page(currentPageId);
+  pageNameElement.textContent = current?.name || '';
+  updateUrl(currentPageId);
+  renderPageList();
+  if (!menuOpen) {
+    requestAnimationFrame(() => {
+      const target = activeView?.controller?.iframe || stage;
+      if (target?.isConnected) target.focus({preventScroll: true});
+    });
+  }
+}
+
+function navigate(pageId) {
+  if (!navigation) return;
+  void navigation.navigate(pageId);
+}
+
+function goBack() {
+  if (!navigation) return;
+  void navigation.goBack();
+}
+
+function executeInteraction(interaction) {
+  if (!interaction) return;
+  if (interaction.action === 'back') {
+    goBack();
+    return;
+  }
+  if (interaction.action === 'navigate' && interaction.target_page_id) {
+    navigate(interaction.target_page_id);
+  }
+}
+
+async function load() {
+  try {
+    state = await api(`/api/projects/${projectId}`);
+    state.overlays = Array.isArray(state.overlays) ? state.overlays : [];
+  } catch (error) {
+    showInitialEmpty(error.message);
+    return;
+  }
+
+  pageCount.textContent = state.pages.length;
+  navigation = window.UIPMPlayerNavigation.create({
+    commit: commitPageView,
+    discard: discardPageView,
+    isValidPage: (pageId) => state.pages.some((item) => item.id === pageId),
+    onCommit: handleNavigationCommit,
+    onError: showTransitionError,
+    onPending: beginTransitionStatus,
+    onSettled: (_request, outcome) => {
+      if (outcome !== 'failed') clearTransitionStatus();
+    },
+    onStateChange: syncNavigationState,
+    prepare: preparePageView,
+  });
+
+  const requestedPageId = new URLSearchParams(location.search).get('page');
+  const initialPageId = state.pages.some((item) => item.id === requestedPageId)
+    ? requestedPageId
+    : state.pages[0]?.id || null;
+  if (!initialPageId) {
+    showInitialEmpty('项目还没有页面。');
+    return;
+  }
+  void navigation.replace(initialPageId);
 }
 
 window.addEventListener('message', (event) => {
   const data = event.data;
-  if (!data || data.pageId !== currentPageId || !frameController?.ownsMessage(event)) return;
+  if (!data) return;
+  const owner = Array.from(pageViews).find((view) => view.controller?.ownsMessage(event));
+  if (!owner || data.pageId !== owner.pageId) return;
+  if (data.type === 'uipm-content-ready') {
+    owner.markContentReady?.();
+    return;
+  }
+  if (owner !== activeView || owner.pageId !== currentPageId) return;
   if (data.type === 'uipm-preview-key' && data.key === 'Escape') {
     toggleMenu();
     return;
