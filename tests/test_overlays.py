@@ -120,6 +120,23 @@ class OverlayApiTests(unittest.TestCase):
             )
         )
 
+    def create_link(
+        self,
+        page_id: str = "image-page",
+        *,
+        url: str = "https://cdn.example.com/overlays/card.png?signature=abc",
+        overlay_type: str = "image",
+        aspect_ratio: float = 2,
+    ) -> dict:
+        return main.api_create_overlay_link(
+            page_id,
+            main.OverlayLinkCreate(
+                url=url,
+                type=overlay_type,
+                aspect_ratio=aspect_ratio,
+            ),
+        )
+
     def test_creates_image_and_video_overlays_for_both_page_types(self) -> None:
         cases = [
             ("image-page", "image"),
@@ -176,6 +193,57 @@ class OverlayApiTests(unittest.TestCase):
 
         with self.assertRaises(HTTPException):
             main.default_overlay_geometry(main.get_page("image-page"), 0)
+
+    def test_link_overlay_uses_direct_url_without_storing_media(self) -> None:
+        source_url = "https://cdn.example.com/overlays/card.png?signature=abc"
+        item = self.create_link(url=source_url)
+
+        self.assertEqual(item["storage_backend"], "url")
+        self.assertEqual(item["storage_key"], source_url)
+        self.assertEqual(item["source_url"], source_url)
+        self.assertEqual(item["content_url"], source_url)
+        self.assertIsNone(item["content_url_expires_at"])
+        self.assertEqual(item["media_type"], "image/png")
+        self.assertEqual(item["size_bytes"], 0)
+        self.assertFalse(any(main.ASSET_DIR.rglob("*")))
+
+        refreshed = main.api_overlay_content_url(item["id"])
+        self.assertEqual(refreshed["content_url"], source_url)
+        self.assertIsNone(refreshed["content_url_expires_at"])
+
+        with (
+            patch("app.main.local_asset_path") as local_path,
+            patch("app.main.object_storage") as storage_factory,
+        ):
+            main.api_delete_overlay(item["id"])
+        local_path.assert_not_called()
+        storage_factory.assert_not_called()
+
+    def test_link_overlay_accepts_extensionless_media_and_rejects_invalid_urls(self) -> None:
+        item = self.create_link(
+            page_id="html-page",
+            url="https://media.example.com/render?id=video-1",
+            overlay_type="video",
+            aspect_ratio=16 / 9,
+        )
+        self.assertEqual(item["media_type"], "video/*")
+
+        cases = [
+            ("javascript:alert(1)", "image", 2),
+            ("https://user:secret@example.com/image.png", "image", 2),
+            ("https://example.com/video.mp4", "image", 2),
+            ("https://example.com/image.png", "document", 2),
+            ("https://example.com/image.png", "image", 0),
+        ]
+        for url, overlay_type, aspect_ratio in cases:
+            with self.subTest(url=url, overlay_type=overlay_type, aspect_ratio=aspect_ratio):
+                with self.assertRaises(HTTPException) as raised:
+                    self.create_link(
+                        url=url,
+                        overlay_type=overlay_type,
+                        aspect_ratio=aspect_ratio,
+                    )
+                self.assertEqual(raised.exception.status_code, 400)
 
     def test_rejects_mismatched_or_invalid_media(self) -> None:
         cases = [
@@ -249,6 +317,60 @@ class OverlayApiTests(unittest.TestCase):
         storage_factory.return_value.delete.assert_called_once_with(
             "uipm/p/o/media.mp4"
         )
+
+    def test_init_db_migrates_existing_overlay_table_for_url_sources(self) -> None:
+        created_at = main.now_iso()
+        with main.db() as connection:
+            connection.execute("DROP INDEX idx_overlays_page")
+            connection.execute("DROP TABLE overlays")
+            connection.execute(
+                """
+                CREATE TABLE overlays (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    page_id TEXT NOT NULL,
+                    type TEXT NOT NULL CHECK(type IN ('image', 'video')),
+                    storage_backend TEXT NOT NULL CHECK(storage_backend IN ('local', 's3')),
+                    storage_key TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
+                    x REAL NOT NULL CHECK(x >= 0 AND x <= 1),
+                    y REAL NOT NULL CHECK(y >= 0 AND y <= 1),
+                    width REAL NOT NULL CHECK(width > 0 AND width <= 1),
+                    height REAL NOT NULL CHECK(height > 0 AND height <= 1),
+                    aspect_ratio REAL NOT NULL CHECK(aspect_ratio > 0),
+                    object_fit TEXT NOT NULL DEFAULT 'cover' CHECK(object_fit IN ('contain', 'cover')),
+                    z_index INTEGER NOT NULL DEFAULT 0 CHECK(z_index >= 0 AND z_index <= 1000),
+                    video_controls INTEGER NOT NULL DEFAULT 1 CHECK(video_controls IN (0, 1)),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK(x + width <= 1.000000001),
+                    CHECK(y + height <= 1.000000001),
+                    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY(page_id) REFERENCES pages(id) ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO overlays(
+                    id, project_id, page_id, type, storage_backend, storage_key,
+                    media_type, size_bytes, x, y, width, height, aspect_ratio,
+                    object_fit, z_index, video_controls, created_at, updated_at
+                ) VALUES (
+                    'existing-overlay', 'project-a', 'image-page', 'image', 'local',
+                    'assets/project-a/overlays/existing.png', 'image/png', 100,
+                    0.1, 0.1, 0.2, 0.2, 1, 'cover', 0, 1, ?, ?
+                )
+                """,
+                (created_at, created_at),
+            )
+
+        main.init_db()
+
+        self.assertEqual(main.get_overlay("existing-overlay")["storage_backend"], "local")
+        linked = self.create_link()
+        self.assertEqual(linked["storage_backend"], "url")
 
 
 if __name__ == "__main__":

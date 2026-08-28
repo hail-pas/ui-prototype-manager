@@ -162,6 +162,18 @@ class PlayerOverlayTests(unittest.TestCase):
         self.assertIn("await afterStablePaint(signal);", player_script)
         self.assertNotIn("stage.innerHTML =", player_script)
 
+    def test_editor_validates_and_creates_direct_link_overlays(self) -> None:
+        static_dir = Path(main.__file__).parent / "static"
+        template_dir = Path(main.__file__).parent / "templates"
+        editor_script = (static_dir / "editor.js").read_text(encoding="utf-8")
+        editor_template = (template_dir / "editor.html").read_text(encoding="utf-8")
+
+        self.assertIn('id="overlayLinkButton"', editor_template)
+        self.assertIn('id="overlayLinkDialog"', editor_template)
+        self.assertIn("inspectOverlayLink(url, type)", editor_script)
+        self.assertIn("/overlays/from-url", editor_script)
+        self.assertIn("media.referrerPolicy = 'no-referrer';", editor_script)
+
 
 class HtmlInstrumentationUpgradeTests(unittest.TestCase):
     def setUp(self) -> None:

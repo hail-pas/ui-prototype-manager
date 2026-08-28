@@ -33,6 +33,14 @@ const renderSettingsPanel = document.getElementById('renderSettingsPanel');
 const overlayElementsSection = document.getElementById('overlayElementsSection');
 const overlayImageInput = document.getElementById('overlayImageInput');
 const overlayVideoInput = document.getElementById('overlayVideoInput');
+const overlayLinkButton = document.getElementById('overlayLinkButton');
+const overlayLinkDialog = document.getElementById('overlayLinkDialog');
+const overlayLinkForm = document.getElementById('overlayLinkForm');
+const overlayLinkType = document.getElementById('overlayLinkType');
+const overlayLinkUrl = document.getElementById('overlayLinkUrl');
+const overlayLinkStatus = document.getElementById('overlayLinkStatus');
+const overlayLinkCancel = document.getElementById('overlayLinkCancel');
+const overlayLinkSubmit = document.getElementById('overlayLinkSubmit');
 const overlayCount = document.getElementById('overlayCount');
 const overlayList = document.getElementById('overlayList');
 const overlaySelectionPanel = document.getElementById('overlaySelectionPanel');
@@ -104,6 +112,7 @@ function pageName(pageId) {
 }
 
 function storageLabel(page) {
+  if (page.storage_backend === 'url') return 'LINK';
   if ((page.storage_backend || 'local') !== 's3') return 'LOCAL';
   return config.s3?.provider === 'oss' ? 'OSS' : 'S3';
 }
@@ -438,6 +447,7 @@ function createEditorOverlayElement(overlay) {
   media.className = 'editor-overlay-media';
   media.draggable = false;
   media.style.objectFit = overlay.object_fit;
+  if (overlay.storage_backend === 'url') media.referrerPolicy = 'no-referrer';
   if (overlay.type === 'video') {
     media.controls = false;
     media.playsInline = true;
@@ -809,6 +819,8 @@ function renderOverlayElements() {
       <span>${overlayDisplayName(selected, items)}</span>
       <span>${selected.type === 'video' ? '视频' : '图片'} · ${storageLabel(selected)}</span>
     </div>
+    ${selected.storage_backend === 'url' ? `
+      <a class="overlay-source-link" href="${esc(selected.source_url || selected.content_url)}" target="_blank" rel="noopener noreferrer" title="${esc(selected.source_url || selected.content_url)}">打开原始链接 ↗</a>` : ''}
     <label for="overlayObjectFit">填充方式</label>
     <select id="overlayObjectFit">
       <option value="cover" ${selected.object_fit === 'cover' ? 'selected' : ''}>裁切填充</option>
@@ -857,7 +869,10 @@ async function deleteOverlay(overlayId) {
   const overlay = overlayById(overlayId);
   if (!overlay || savingOverlayIds.has(overlayId)) return;
   const name = overlayDisplayName(overlay);
-  if (!window.confirm(`删除${name}？底层媒体资源也会同步删除。`)) return;
+  const deleteMessage = overlay.storage_backend === 'url'
+    ? `删除${name}？只会移除页面中的链接配置，原始媒体不会受影响。`
+    : `删除${name}？底层媒体资源也会同步删除。`;
+  if (!window.confirm(deleteMessage)) return;
   savingOverlayIds.add(overlayId);
   try {
     await api(`/api/overlays/${overlayId}`, {method: 'DELETE'});
@@ -878,11 +893,16 @@ function updateOverlayUploadStatus(file) {
   overlayUploadDetail.textContent = `${file.name} · 已耗时 ${elapsed} 秒`;
 }
 
-function setOverlayUploadInProgress(inProgress, file = null) {
+function setOverlayControlsBusy(inProgress) {
   overlayUploadInProgress = inProgress;
   overlayElementsSection.classList.toggle('is-uploading', inProgress);
   overlayImageInput.disabled = inProgress;
   overlayVideoInput.disabled = inProgress;
+  overlayLinkButton.disabled = inProgress;
+}
+
+function setOverlayUploadInProgress(inProgress, file = null) {
+  setOverlayControlsBusy(inProgress);
   overlayUploadStatus.hidden = !inProgress;
   if (overlayUploadTimer) {
     clearInterval(overlayUploadTimer);
@@ -930,6 +950,161 @@ async function uploadOverlay(input) {
 
 overlayImageInput.addEventListener('change', () => void uploadOverlay(overlayImageInput));
 overlayVideoInput.addEventListener('change', () => void uploadOverlay(overlayVideoInput));
+
+function normalizeOverlayLink(value) {
+  const raw = String(value || '').trim();
+  if (!raw) throw new Error('请输入媒体链接');
+  if (raw.length > 2048) throw new Error('媒体链接不能超过 2048 个字符');
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error('请输入完整、有效的媒体链接');
+  }
+  if (!['http:', 'https:'].includes(url.protocol)) {
+    throw new Error('媒体链接必须使用 HTTP 或 HTTPS');
+  }
+  if (url.username || url.password) throw new Error('媒体链接不能包含账号或密码');
+  if (location.protocol === 'https:' && url.protocol !== 'https:') {
+    throw new Error('HTTPS 页面只能使用 HTTPS 媒体链接');
+  }
+  return url.href;
+}
+
+function inspectOverlayLink(url, type) {
+  const media = document.createElement(type === 'video' ? 'video' : 'img');
+  media.referrerPolicy = 'no-referrer';
+  if (type === 'video') {
+    media.preload = 'metadata';
+    media.muted = true;
+    media.playsInline = true;
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      media.onload = null;
+      media.onerror = null;
+      media.onloadedmetadata = null;
+    };
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      const width = type === 'video' ? media.videoWidth : media.naturalWidth;
+      const height = type === 'video' ? media.videoHeight : media.naturalHeight;
+      cleanup();
+      if (type === 'video') {
+        media.pause();
+        media.removeAttribute('src');
+        media.load();
+      } else {
+        media.removeAttribute('src');
+      }
+      if (error) {
+        reject(error);
+        return;
+      }
+      if (!width || !height) {
+        reject(new Error('媒体链接没有有效的宽高信息'));
+        return;
+      }
+      resolve({width, height, aspectRatio: width / height});
+    };
+    const ready = () => finish();
+    const failed = () => finish(new Error(`链接无法作为${type === 'video' ? '视频' : '图片'}加载`));
+    const timeout = window.setTimeout(
+      () => finish(new Error('媒体链接验证超时，请检查链接是否可公开访问')),
+      15_000,
+    );
+    media.onerror = failed;
+    if (type === 'video') media.onloadedmetadata = ready;
+    else media.onload = ready;
+    media.src = url;
+    if (type === 'video') media.load();
+  });
+}
+
+function setOverlayLinkStatus(message = '', state = '') {
+  overlayLinkStatus.textContent = message;
+  overlayLinkStatus.classList.toggle('is-error', state === 'error');
+  overlayLinkStatus.classList.toggle('is-success', state === 'success');
+}
+
+function setOverlayLinkInProgress(inProgress) {
+  setOverlayControlsBusy(inProgress);
+  overlayUploadStatus.hidden = true;
+  overlayLinkForm.setAttribute('aria-busy', String(inProgress));
+  overlayLinkType.disabled = inProgress;
+  overlayLinkUrl.disabled = inProgress;
+  overlayLinkCancel.disabled = inProgress;
+  overlayLinkSubmit.disabled = inProgress;
+  overlayLinkSubmit.textContent = inProgress ? '正在验证…' : '验证并添加';
+}
+
+function selectCreatedOverlay(saved) {
+  selection = null;
+  hoveredInteractionId = null;
+  selectedOverlayId = saved.id;
+  hoveredOverlayId = null;
+  state.overlays.push(saved);
+  renderSelection();
+  renderInteractions();
+  refreshCanvasAnnotations({rerenderImage: true});
+  renderOverlayElements();
+  rerenderEditorOverlays();
+}
+
+overlayLinkButton.addEventListener('click', () => {
+  if (!currentPage() || overlayUploadInProgress || !confirmDiscardSelection()) return;
+  overlayLinkForm.reset();
+  setOverlayLinkStatus();
+  overlayLinkDialog.showModal();
+  requestAnimationFrame(() => overlayLinkUrl.focus());
+});
+
+overlayLinkCancel.addEventListener('click', () => {
+  if (!overlayUploadInProgress) overlayLinkDialog.close();
+});
+
+overlayLinkDialog.addEventListener('cancel', (event) => {
+  if (overlayUploadInProgress) event.preventDefault();
+});
+
+overlayLinkForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const page = currentPage();
+  if (!page || overlayUploadInProgress) return;
+  let url;
+  try {
+    url = normalizeOverlayLink(overlayLinkUrl.value);
+  } catch (error) {
+    setOverlayLinkStatus(error.message, 'error');
+    return;
+  }
+
+  const type = overlayLinkType.value;
+  setOverlayLinkInProgress(true);
+  setOverlayLinkStatus('正在加载链接并校验媒体类型与尺寸…');
+  try {
+    const media = await inspectOverlayLink(url, type);
+    setOverlayLinkStatus(`验证通过：${media.width} × ${media.height}，正在保存配置…`, 'success');
+    const saved = await api(`/api/pages/${page.id}/overlays/from-url`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        url,
+        type,
+        aspect_ratio: Number(media.aspectRatio.toFixed(8)),
+      }),
+    });
+    selectCreatedOverlay(saved);
+    overlayLinkDialog.close();
+  } catch (error) {
+    setOverlayLinkStatus(error.message, 'error');
+  } finally {
+    setOverlayLinkInProgress(false);
+  }
+});
 
 function renderRenderSettings() {
   const page = currentPage();

@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{{ project.name }} · UI Prototype Manager</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260827-media-overlay-highlight" />
+  <link rel="stylesheet" href="/static/app.css?v=20260828-overlay-link" />
 </head>
 <body class="editor-body">
   <div id="app" data-project-id="{{ project.id }}" class="editor-shell">
@@ -38,6 +38,7 @@
         <div class="overlay-add-actions">
           <label class="ghost-btn overlay-add-btn">＋ 图片<input id="overlayImageInput" type="file" accept=".png,.jpg,.jpeg,.webp,.gif" hidden /></label>
           <label class="ghost-btn overlay-add-btn">＋ 视频<input id="overlayVideoInput" type="file" accept=".mp4,.webm" hidden /></label>
+          <button id="overlayLinkButton" class="ghost-btn overlay-add-btn" type="button">＋ 链接</button>
         </div>
         <div id="overlayUploadStatus" class="overlay-upload-status" role="status" aria-live="polite" hidden>
           <span class="upload-spinner" aria-hidden="true"></span>
@@ -93,6 +94,29 @@
     </form>
   </dialog>
 
+  <dialog id="overlayLinkDialog" class="dialog compact-dialog overlay-link-dialog">
+    <form id="overlayLinkForm">
+      <h2>添加媒体链接</h2>
+      <div class="overlay-link-fields">
+        <label>媒体类型
+          <select id="overlayLinkType">
+            <option value="image">图片</option>
+            <option value="video">视频</option>
+          </select>
+        </label>
+        <label>媒体 URL
+          <input id="overlayLinkUrl" type="url" maxlength="2048" autocomplete="off" placeholder="https://example.com/media.png" required />
+        </label>
+      </div>
+      <p class="dialog-note">链接必须是可直接加载的 HTTP(S) 图片或视频。媒体只会从原链接展示，不会上传或复制到存储。</p>
+      <p id="overlayLinkStatus" class="overlay-link-status" role="status" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button type="button" id="overlayLinkCancel" class="ghost-btn">取消</button>
+        <button type="submit" id="overlayLinkSubmit" class="primary-btn">验证并添加</button>
+      </div>
+    </form>
+  </dialog>
+
   <dialog id="confirmDialog" class="dialog compact-dialog">
     <form method="dialog"><h2>确认删除</h2><p id="confirmText"></p><div class="dialog-actions"><button type="button" id="confirmCancel" class="ghost-btn">取消</button><button type="button" id="confirmOk" class="danger-btn">删除</button></div></form>
   </dialog>
@@ -107,6 +131,6 @@
   </dialog>
 
   <script src="/static/frame-fit.js?v=20260827-media-overlay"></script>
-  <script src="/static/editor.js?v=20260827-media-overlay-highlight"></script>
+  <script src="/static/editor.js?v=20260828-overlay-link"></script>
 </body>
 </html>

@@ -263,6 +263,7 @@ function createPlayerOverlay(item, signal) {
   media.className = `player-overlay is-${item.type}`;
   media.draggable = false;
   media.style.objectFit = item.object_fit;
+  if (item.storage_backend === 'url') media.referrerPolicy = 'no-referrer';
   Object.assign(media.style, {
     left: `${item.x * 100}%`,
     top: `${item.y * 100}%`,

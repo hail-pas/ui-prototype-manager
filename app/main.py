@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Iterator
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
@@ -62,6 +62,7 @@ OVERLAY_IMAGE_MAX_BYTES = 25 * 1024 * 1024
 OVERLAY_VIDEO_MAX_BYTES = 100 * 1024 * 1024
 OVERLAY_DEFAULT_WIDTH = 0.3
 OVERLAY_MAX_Z_INDEX = 1000
+OVERLAY_URL_MAX_LENGTH = 2048
 OVERLAY_MEDIA_TYPES = {
     ".png": ("image", "image/png"),
     ".jpg": ("image", "image/jpeg"),
@@ -160,6 +161,70 @@ def db() -> sqlite3.Connection:
     return conn
 
 
+def ensure_overlay_url_schema(conn: sqlite3.Connection) -> None:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'overlays'"
+    ).fetchone()
+    if not row:
+        return
+    normalized_sql = re.sub(r"\s+", "", str(row["sql"] or "").lower())
+    if "storage_backendin('local','s3','url')" in normalized_sql:
+        return
+
+    conn.execute("DROP INDEX IF EXISTS idx_overlays_page")
+    conn.execute("ALTER TABLE overlays RENAME TO overlays_before_url_support")
+    conn.execute(
+        """
+        CREATE TABLE overlays (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            page_id TEXT NOT NULL,
+            type TEXT NOT NULL CHECK(type IN ('image', 'video')),
+            storage_backend TEXT NOT NULL CHECK(storage_backend IN ('local', 's3', 'url')),
+            storage_key TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+            x REAL NOT NULL CHECK(x >= 0 AND x <= 1),
+            y REAL NOT NULL CHECK(y >= 0 AND y <= 1),
+            width REAL NOT NULL CHECK(width > 0 AND width <= 1),
+            height REAL NOT NULL CHECK(height > 0 AND height <= 1),
+            aspect_ratio REAL NOT NULL CHECK(aspect_ratio > 0),
+            object_fit TEXT NOT NULL DEFAULT 'cover' CHECK(object_fit IN ('contain', 'cover')),
+            z_index INTEGER NOT NULL DEFAULT 0 CHECK(z_index >= 0 AND z_index <= 1000),
+            video_controls INTEGER NOT NULL DEFAULT 1 CHECK(video_controls IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK(x + width <= 1.000000001),
+            CHECK(y + height <= 1.000000001),
+            CHECK(
+                (storage_backend = 'url' AND size_bytes = 0)
+                OR (storage_backend IN ('local', 's3') AND size_bytes > 0)
+            ),
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            FOREIGN KEY(page_id) REFERENCES pages(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO overlays(
+            id, project_id, page_id, type, storage_backend, storage_key,
+            media_type, size_bytes, x, y, width, height, aspect_ratio,
+            object_fit, z_index, video_controls, created_at, updated_at
+        )
+        SELECT
+            id, project_id, page_id, type, storage_backend, storage_key,
+            media_type, size_bytes, x, y, width, height, aspect_ratio,
+            object_fit, z_index, video_controls, created_at, updated_at
+        FROM overlays_before_url_support
+        """
+    )
+    conn.execute("DROP TABLE overlays_before_url_support")
+    conn.execute(
+        "CREATE INDEX idx_overlays_page ON overlays(page_id, z_index, created_at)"
+    )
+
+
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ASSET_DIR.mkdir(parents=True, exist_ok=True)
@@ -219,10 +284,10 @@ def init_db() -> None:
                 project_id TEXT NOT NULL,
                 page_id TEXT NOT NULL,
                 type TEXT NOT NULL CHECK(type IN ('image', 'video')),
-                storage_backend TEXT NOT NULL CHECK(storage_backend IN ('local', 's3')),
+                storage_backend TEXT NOT NULL CHECK(storage_backend IN ('local', 's3', 'url')),
                 storage_key TEXT NOT NULL,
                 media_type TEXT NOT NULL,
-                size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
+                size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
                 x REAL NOT NULL CHECK(x >= 0 AND x <= 1),
                 y REAL NOT NULL CHECK(y >= 0 AND y <= 1),
                 width REAL NOT NULL CHECK(width > 0 AND width <= 1),
@@ -235,6 +300,10 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL,
                 CHECK(x + width <= 1.000000001),
                 CHECK(y + height <= 1.000000001),
+                CHECK(
+                    (storage_backend = 'url' AND size_bytes = 0)
+                    OR (storage_backend IN ('local', 's3') AND size_bytes > 0)
+                ),
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
                 FOREIGN KEY(page_id) REFERENCES pages(id) ON DELETE CASCADE
             );
@@ -251,6 +320,7 @@ def init_db() -> None:
                 ON overlays(page_id, z_index, created_at);
             """
         )
+        ensure_overlay_url_schema(conn)
         page_columns = {
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(pages)").fetchall()
@@ -466,6 +536,8 @@ def delete_overlay_asset(
     try:
         backend = str(overlay["storage_backend"])
         key = str(overlay["storage_key"])
+        if backend == "url":
+            return
         if backend == "local":
             path = local_asset_path(key)
             path.unlink(missing_ok=True)
@@ -522,6 +594,11 @@ def page_to_api(page: dict[str, Any]) -> dict[str, Any]:
 def overlay_to_api(overlay: dict[str, Any]) -> dict[str, Any]:
     item = dict(overlay)
     item["video_controls"] = bool(item.get("video_controls"))
+    if item.get("storage_backend") == "url":
+        item["source_url"] = str(item["storage_key"])
+        item["content_url"] = str(item["storage_key"])
+        item["content_url_expires_at"] = None
+        return item
     token, expires_at = create_content_token(f'overlay:{item["id"]}')
     asset_name = quote(Path(str(item["storage_key"])).name, safe="")
     item["content_url"] = f'/overlay-content/{item["id"]}/{token}/{asset_name}'
@@ -569,6 +646,12 @@ class OverlayUpdate(BaseModel):
     object_fit: str | None = None
     z_index: int | None = None
     video_controls: bool | None = None
+
+
+class OverlayLinkCreate(BaseModel):
+    url: str
+    type: str
+    aspect_ratio: float
 
 
 @dataclass(frozen=True)
@@ -894,6 +977,55 @@ def inspect_overlay_upload(
         raise HTTPException(400, f"{filename} is not a valid {overlay_type} file") from exc
     upload.file.seek(0)
     return overlay_type, media_type, suffix, size, width, height
+
+
+def validate_overlay_link(
+    url: str, overlay_type: str, aspect_ratio: float
+) -> tuple[str, str, float]:
+    value = str(url or "").strip()
+    if not value:
+        raise HTTPException(400, "Overlay URL is required")
+    if len(value) > OVERLAY_URL_MAX_LENGTH:
+        raise HTTPException(
+            400, f"Overlay URL must be at most {OVERLAY_URL_MAX_LENGTH} characters"
+        )
+    if any(character.isspace() or ord(character) < 32 for character in value):
+        raise HTTPException(400, "Overlay URL cannot contain whitespace or control characters")
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise HTTPException(400, "Overlay URL is invalid") from exc
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise HTTPException(400, "Overlay URL must use http or https")
+    if not hostname:
+        raise HTTPException(400, "Overlay URL must include a hostname")
+    if parsed.username is not None or parsed.password is not None:
+        raise HTTPException(400, "Overlay URL cannot include credentials")
+    if port is not None and not 1 <= port <= 65535:
+        raise HTTPException(400, "Overlay URL port is invalid")
+
+    normalized_type = str(overlay_type or "").strip().lower()
+    if normalized_type not in {"image", "video"}:
+        raise HTTPException(400, "Overlay type must be image or video")
+    try:
+        normalized_ratio = float(aspect_ratio)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, "Overlay aspect ratio is invalid") from exc
+    if not math.isfinite(normalized_ratio) or not 0.01 <= normalized_ratio <= 100:
+        raise HTTPException(400, "Overlay aspect ratio must be between 0.01 and 100")
+
+    suffix = PurePosixPath(unquote(parsed.path)).suffix.lower()
+    media_definition = OVERLAY_MEDIA_TYPES.get(suffix)
+    if media_definition and media_definition[0] != normalized_type:
+        raise HTTPException(400, "Overlay URL extension does not match its media type")
+    media_type = media_definition[1] if media_definition else f"{normalized_type}/*"
+    normalized_url = urlunsplit(
+        (scheme, parsed.netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+    return normalized_url, media_type, normalized_ratio
 
 
 def page_canvas_dimensions(page: dict[str, Any]) -> tuple[int, int]:
@@ -1665,6 +1797,57 @@ async def api_create_overlay(
     except Exception:
         delete_overlay_asset(overlay_stub, suppress_errors=True)
         raise
+    return overlay_to_api(get_overlay(overlay_id))
+
+
+@app.post("/api/pages/{page_id}/overlays/from-url")
+def api_create_overlay_link(page_id: str, payload: OverlayLinkCreate):
+    page = get_page(page_id)
+    if page["type"] not in {"image", "html"}:
+        raise HTTPException(400, "Overlays are only supported on image or HTML pages")
+
+    source_url, media_type, aspect_ratio = validate_overlay_link(
+        payload.url, payload.type, payload.aspect_ratio
+    )
+    geometry = normalize_overlay_geometry(
+        default_overlay_geometry(page, aspect_ratio)
+    )
+    overlay_id = str(uuid.uuid4())
+    created_at = now_iso()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(MAX(z_index), -1) AS z_index
+            FROM overlays WHERE page_id = ?
+            """,
+            (page_id,),
+        ).fetchone()
+        z_index = min(int(row["z_index"]) + 1, OVERLAY_MAX_Z_INDEX)
+        conn.execute(
+            """
+            INSERT INTO overlays(
+                id, project_id, page_id, type, storage_backend, storage_key,
+                media_type, size_bytes, x, y, width, height, aspect_ratio,
+                object_fit, z_index, video_controls, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'url', ?, ?, 0, ?, ?, ?, ?, ?, 'cover', ?, 1, ?, ?)
+            """,
+            (
+                overlay_id,
+                page["project_id"],
+                page_id,
+                payload.type.strip().lower(),
+                source_url,
+                media_type,
+                geometry["x"],
+                geometry["y"],
+                geometry["width"],
+                geometry["height"],
+                aspect_ratio,
+                z_index,
+                created_at,
+                created_at,
+            ),
+        )
     return overlay_to_api(get_overlay(overlay_id))
 
 
