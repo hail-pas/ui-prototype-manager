@@ -5,6 +5,8 @@ const backBtn = document.getElementById('backBtn');
 const fullscreenBtn = document.getElementById('fullscreenBtn');
 const pageList = document.getElementById('playerPageList');
 const pageCount = document.getElementById('playerPageCount');
+const pageSearchInput = document.getElementById('playerPageSearchInput');
+const pageSearchClear = document.getElementById('playerPageSearchClear');
 const pageNameElement = document.getElementById('playerPageName');
 const menuLayer = document.getElementById('playerMenuLayer');
 const menuBackdrop = document.getElementById('playerMenuBackdrop');
@@ -15,6 +17,7 @@ const PAGE_LOADING_DELAY_MS = 250;
 const PAGE_ERROR_VISIBLE_MS = 5_000;
 const PAGE_TRANSITION_MS = 140;
 const PAGE_CACHE_TTL_MS = 30_000;
+const HOTSPOT_REVEAL_MS = 500;
 
 let state = {pages: [], interactions: [], overlays: []};
 let currentPageId = null;
@@ -29,6 +32,7 @@ let transitionStatusTimer = null;
 let transitionStatusHideTimer = null;
 const pageViews = new Set();
 const contentUrlRefreshes = new Map();
+const hotspotRevealTimers = new WeakMap();
 
 function esc(value = '') {
   const element = document.createElement('div');
@@ -379,9 +383,36 @@ function appendImageHotspots(container, pageId) {
       width: `${region.width * 100}%`,
       height: `${region.height * 100}%`,
     });
+    const label = document.createElement('span');
+    label.textContent = interaction.name || '交互区域';
+    hotspot.appendChild(label);
     hotspot.addEventListener('click', () => executeInteraction(interaction));
     container.appendChild(hotspot);
   });
+}
+
+function revealImageHotspots(container) {
+  window.clearTimeout(hotspotRevealTimers.get(container));
+  container.classList.add('is-revealing-hotspots');
+  const timer = window.setTimeout(() => {
+    container.classList.remove('is-revealing-hotspots');
+    hotspotRevealTimers.delete(container);
+  }, HOTSPOT_REVEAL_MS);
+  hotspotRevealTimers.set(container, timer);
+}
+
+function handleImageBlankClick(event, pageId) {
+  const container = event.currentTarget;
+  if (event.target.closest('.player-hotspot')) return;
+  const rect = container.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const x = (event.clientX - rect.left) / rect.width;
+  const y = (event.clientY - rect.top) / rect.height;
+  const regions = interactions(pageId)
+    .filter((item) => item.kind === 'region')
+    .map((item) => item.payload);
+  const overInteraction = window.UIPMPageList.pointInsideRegions(regions, x, y);
+  if (!overInteraction) revealImageHotspots(container);
 }
 
 function createImagePageView(item, signal) {
@@ -395,6 +426,7 @@ function createImagePageView(item, signal) {
   const overlay = createPlayerOverlayLayer(item.id, signal);
   imageStage.appendChild(overlay.layer);
   appendImageHotspots(imageStage, item.id);
+  imageStage.addEventListener('click', (event) => handleImageBlankClick(event, item.id));
   element.appendChild(imageStage);
 
   const loadBaseImage = async () => {
@@ -424,6 +456,8 @@ function destroyPageView(view) {
   view.destroyed = true;
   view.abortController?.abort();
   view.controller?.destroy();
+  const imageStage = view.element.querySelector('.player-image-stage');
+  if (imageStage) window.clearTimeout(hotspotRevealTimers.get(imageStage));
   view.element.querySelectorAll('video, audio').forEach((media) => {
     media.pause();
     media.removeAttribute('src');
@@ -621,7 +655,16 @@ function renderPageList(pendingPageId = null) {
     pageList.innerHTML = '<div class="player-nav-empty">暂无页面</div>';
     return;
   }
-  pageList.innerHTML = state.pages.map((item) => `
+  const query = pageSearchInput.value;
+  const visiblePages = window.UIPMPageList.filterByName(state.pages, query);
+  const searching = Boolean(query.trim());
+  pageSearchClear.hidden = !searching;
+  pageCount.textContent = searching ? `${visiblePages.length}/${state.pages.length}` : state.pages.length;
+  if (!visiblePages.length) {
+    pageList.innerHTML = '<div class="player-nav-empty">没有匹配的页面</div>';
+    return;
+  }
+  pageList.innerHTML = visiblePages.map((item) => `
     <button type="button" class="player-page-item ${item.id === currentPageId ? 'active' : ''} ${item.id === pendingPageId ? 'pending' : ''}" data-id="${item.id}">
       <span class="player-page-type">${item.type === 'html' ? 'HTML' : 'IMG'}</span>
       <span class="player-page-name">${esc(item.name)}</span>
@@ -763,5 +806,11 @@ fullscreenBtn.addEventListener('click', () => void toggleFullscreen());
 document.addEventListener('fullscreenchange', syncFullscreenState);
 menuCloseBtn.addEventListener('click', () => setMenuOpen(false));
 menuBackdrop.addEventListener('click', () => setMenuOpen(false));
+pageSearchInput.addEventListener('input', () => renderPageList(navigation?.getState().pendingPageId));
+pageSearchClear.addEventListener('click', () => {
+  pageSearchInput.value = '';
+  renderPageList(navigation?.getState().pendingPageId);
+  pageSearchInput.focus();
+});
 
 void load();

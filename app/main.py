@@ -530,6 +530,19 @@ def delete_asset_package(
             pass
 
 
+def delete_page_asset_file(page: dict[str, Any], relative_path: str) -> None:
+    """Delete one page asset without touching the page's remaining package."""
+    key = asset_storage_key(page, relative_path)
+    backend = page.get("storage_backend")
+    if backend == "local":
+        local_asset_path(key).unlink(missing_ok=True)
+        return
+    if backend == "s3":
+        object_storage().delete(key)
+        return
+    raise RuntimeError(f"Unsupported storage backend: {backend}")
+
+
 def delete_overlay_asset(
     overlay: dict[str, Any], *, suppress_errors: bool = False
 ) -> None:
@@ -621,6 +634,10 @@ class PageUpdate(BaseModel):
     render_mode: str | None = None
     viewport_width: int | None = None
     viewport_height: int | None = None
+
+
+class PageOrderUpdate(BaseModel):
+    page_ids: list[str]
 
 
 class InteractionCreate(BaseModel):
@@ -1522,6 +1539,31 @@ def api_project(project_id: str):
     return project
 
 
+@app.put("/api/projects/{project_id}/pages/order")
+def api_update_page_order(project_id: str, payload: PageOrderUpdate):
+    get_project(project_id)
+    requested_ids = [str(page_id) for page_id in payload.page_ids]
+    if len(requested_ids) != len(set(requested_ids)):
+        raise HTTPException(400, "page_ids must not contain duplicates")
+
+    with db() as conn:
+        existing_ids = [
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM pages WHERE project_id = ?", (project_id,)
+            ).fetchall()
+        ]
+        if len(requested_ids) != len(existing_ids) or set(requested_ids) != set(existing_ids):
+            raise HTTPException(
+                400, "page_ids must contain every page in the project exactly once"
+            )
+        conn.executemany(
+            "UPDATE pages SET sort_order = ? WHERE id = ? AND project_id = ?",
+            [(index, page_id, project_id) for index, page_id in enumerate(requested_ids)],
+        )
+    return {"page_ids": requested_ids}
+
+
 @app.post("/api/projects/{project_id}/pages")
 async def api_upload_pages(
     project_id: str,
@@ -1692,6 +1734,64 @@ def api_update_page(page_id: str, payload: PageUpdate):
             raise duplicate_error("页面", str(updates["name"])) from exc
         raise HTTPException(409, "页面配置冲突") from exc
     return get_page(page_id)
+
+
+@app.put("/api/pages/{page_id}/image")
+async def api_replace_page_image(page_id: str, file: UploadFile = File(...)):
+    page = get_page(page_id)
+    if page["type"] != "image":
+        raise HTTPException(400, "Only image pages can replace their base image")
+
+    filename = safe_filename(file.filename or "image")
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+        raise HTTPException(400, f"Unsupported image type: {filename}")
+    file.file.seek(0)
+    size = file_size(file.file)
+    file.file.seek(0)
+    if size == 0:
+        raise HTTPException(400, f"{filename} is empty")
+    if size > IMAGE_MAX_BYTES:
+        raise HTTPException(413, f"{filename} is too large")
+
+    new_entry_path = f"image-{uuid.uuid4().hex}{suffix}"
+    media_type = media_type_for_path(new_entry_path)
+    old_entry_path = str(page["entry_path"])
+    try:
+        await run_in_threadpool(
+            store_asset_stream,
+            backend=str(page["storage_backend"]),
+            key=asset_storage_key(page, new_entry_path),
+            fileobj=file.file,
+            size=size,
+            media_type=media_type,
+        )
+        with db() as conn:
+            conn.execute("DELETE FROM page_assets WHERE page_id = ?", (page_id,))
+            conn.execute(
+                """
+                INSERT INTO page_assets(page_id, relative_path, media_type, size_bytes)
+                VALUES (?, ?, ?, ?)
+                """,
+                (page_id, new_entry_path, media_type, size),
+            )
+            conn.execute(
+                "UPDATE pages SET entry_path = ? WHERE id = ?",
+                (new_entry_path, page_id),
+            )
+    except Exception:
+        try:
+            delete_page_asset_file(page, new_entry_path)
+        except Exception:
+            pass
+        raise
+
+    if old_entry_path != new_entry_path:
+        try:
+            delete_page_asset_file(page, old_entry_path)
+        except Exception:
+            pass
+    return page_to_api(get_page(page_id))
 
 
 @app.delete("/api/pages/{page_id}")

@@ -5,6 +5,9 @@ const canvasArea = document.getElementById('canvasArea');
 const selectionPanel = document.getElementById('selectionPanel');
 const interactionList = document.getElementById('interactionList');
 const pageCount = document.getElementById('pageCount');
+const pageSearchInput = document.getElementById('pageSearchInput');
+const pageSearchClear = document.getElementById('pageSearchClear');
+const replaceImageInput = document.getElementById('replaceImageInput');
 const interactionCount = document.getElementById('interactionCount');
 const currentPageName = document.getElementById('currentPageName');
 const currentPageMeta = document.getElementById('currentPageMeta');
@@ -74,6 +77,9 @@ const contentUrlRefreshes = new Map();
 let uploadStartedAt = 0;
 let uploadTimer = null;
 let uploadInProgress = false;
+let draggedPageId = null;
+let pageOrderSaving = false;
+let replaceImagePageId = null;
 
 function esc(value = '') {
   const element = document.createElement('div');
@@ -271,18 +277,28 @@ function renderAll() {
 }
 
 function renderPageList() {
-  pageCount.textContent = state.pages.length;
+  const query = pageSearchInput.value;
+  const visiblePages = window.UIPMPageList.filterByName(state.pages, query);
+  const searching = Boolean(query.trim());
+  pageSearchClear.hidden = !searching;
+  pageCount.textContent = searching ? `${visiblePages.length}/${state.pages.length}` : state.pages.length;
   if (!state.pages.length) {
     pageList.innerHTML = '<div class="interaction-empty">暂无页面</div>';
     return;
   }
-  pageList.innerHTML = state.pages.map((page) => `
-    <div class="page-item ${page.id === currentPageId ? 'active' : ''}" data-id="${page.id}">
+  if (!visiblePages.length) {
+    pageList.innerHTML = '<div class="interaction-empty">没有匹配的页面</div>';
+    return;
+  }
+  pageList.innerHTML = visiblePages.map((page) => `
+    <div class="page-item ${page.id === currentPageId ? 'active' : ''}" data-id="${page.id}" draggable="${!searching && page.id === currentPageId && !pageOrderSaving}">
+      <span class="page-drag-handle" title="选中后上下拖动排序" aria-hidden="true">⠿</span>
       <div class="page-type-icon">${page.type === 'html' ? 'HTML' : 'IMG'}</div>
       <div class="page-main">
         <div class="page-name" title="${esc(page.name)}">${esc(page.name)}</div>
         <div class="page-storage">${storageLabel(page)}</div>
       </div>
+      ${page.type === 'image' ? `<button class="mini-action replace-page-image" type="button" title="替换主体图片" aria-label="替换 ${esc(page.name)} 的主体图片">↻</button>` : ''}
       <button class="mini-action rename-page" type="button" title="重命名" aria-label="重命名 ${esc(page.name)}">✎</button>
       <button class="mini-danger delete-page" type="button" title="删除页面" aria-label="删除 ${esc(page.name)}">✕</button>
     </div>`).join('');
@@ -300,6 +316,13 @@ function renderPageList() {
       htmlElementMeta = new Map();
       renderAll();
     });
+    row.querySelector('.replace-page-image')?.addEventListener('click', (event) => {
+      event.stopPropagation();
+      if (!confirmDiscardSelection()) return;
+      replaceImagePageId = row.dataset.id;
+      replaceImageInput.value = '';
+      replaceImageInput.click();
+    });
     row.querySelector('.rename-page').addEventListener('click', (event) => {
       event.stopPropagation();
       if (!confirmDiscardSelection()) return;
@@ -309,7 +332,63 @@ function renderPageList() {
       event.stopPropagation();
       askDeletePage(row.dataset.id);
     });
+    row.addEventListener('dragstart', (event) => {
+      if (searching || pageOrderSaving || row.dataset.id !== currentPageId) {
+        event.preventDefault();
+        return;
+      }
+      draggedPageId = row.dataset.id;
+      row.classList.add('is-dragging');
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', draggedPageId);
+    });
+    row.addEventListener('dragover', (event) => {
+      if (!draggedPageId || draggedPageId === row.dataset.id) return;
+      event.preventDefault();
+      const after = event.clientY >= row.getBoundingClientRect().top + row.offsetHeight / 2;
+      row.classList.toggle('drop-after', after);
+      row.classList.toggle('drop-before', !after);
+    });
+    row.addEventListener('dragleave', () => row.classList.remove('drop-before', 'drop-after'));
+    row.addEventListener('drop', async (event) => {
+      event.preventDefault();
+      const sourceId = draggedPageId;
+      const targetId = row.dataset.id;
+      const after = event.clientY >= row.getBoundingClientRect().top + row.offsetHeight / 2;
+      clearPageDragState();
+      if (!sourceId || sourceId === targetId) return;
+      await persistPageOrder(window.UIPMPageList.movePage(state.pages, sourceId, targetId, after));
+    });
+    row.addEventListener('dragend', clearPageDragState);
   });
+}
+
+function clearPageDragState() {
+  draggedPageId = null;
+  pageList.querySelectorAll('.page-item').forEach((row) => {
+    row.classList.remove('is-dragging', 'drop-before', 'drop-after');
+  });
+}
+
+async function persistPageOrder(nextPages) {
+  const previousPages = state.pages;
+  state.pages = nextPages;
+  pageOrderSaving = true;
+  renderPageList();
+  try {
+    await api(`/api/projects/${projectId}/pages/order`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({page_ids: nextPages.map((page) => page.id)}),
+    });
+    state.pages.forEach((page, index) => { page.sort_order = index; });
+  } catch (error) {
+    state.pages = previousPages;
+    alert(error.message);
+  } finally {
+    pageOrderSaving = false;
+    renderPageList();
+  }
 }
 
 async function renderCanvas() {
@@ -1680,6 +1759,32 @@ function prepareUpload(files) {
     </div>`).join('');
   uploadDialog.showModal();
 }
+
+pageSearchInput.addEventListener('input', renderPageList);
+pageSearchClear.addEventListener('click', () => {
+  pageSearchInput.value = '';
+  renderPageList();
+  pageSearchInput.focus();
+});
+
+replaceImageInput.addEventListener('change', async () => {
+  const page = state.pages.find((item) => item.id === replaceImagePageId);
+  const file = replaceImageInput.files?.[0];
+  replaceImageInput.value = '';
+  replaceImagePageId = null;
+  if (!page || page.type !== 'image' || !file) return;
+  const data = new FormData();
+  data.append('file', file);
+  try {
+    const updated = await api(`/api/pages/${page.id}/image`, {method: 'PUT', body: data});
+    Object.assign(page, updated);
+    contentUrlRefreshes.delete(page.id);
+    if (page.id === currentPageId) renderCanvas();
+    renderPageList();
+  } catch (error) {
+    alert(error.message);
+  }
+});
 
 document.getElementById('fileInput').addEventListener('change', (event) => prepareUpload(event.target.files));
 uploadCancel.addEventListener('click', () => {

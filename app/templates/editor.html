@@ -23,8 +23,12 @@
 
     <aside class="sidebar left-sidebar">
       <div class="panel-heading"><span>页面</span><span id="pageCount" class="count-pill">0</span></div>
+      <div class="page-search">
+        <input id="pageSearchInput" type="search" autocomplete="off" placeholder="按名称搜索页面" aria-label="按名称搜索页面" />
+        <button id="pageSearchClear" type="button" aria-label="清空页面搜索" title="清空" hidden>×</button>
+      </div>
       <div id="pageList" class="page-list"></div>
-      <div class="sidebar-tip">HTML 与图片共用页面名称空间，同一项目内名称不可重复；交互名称单独校验。</div>
+      <div class="sidebar-tip">先选中页面，再上下拖动调整顺序；搜索时暂停排序。HTML 与图片共用页面名称空间。</div>
     </aside>
 
     <main class="workspace">
@@ -130,7 +134,10 @@
     </form>
   </dialog>
 
+  <input id="replaceImageInput" type="file" accept=".png,.jpg,.jpeg,.webp,.gif" hidden />
+
   <script src="/static/frame-fit.js?v=20260827-media-overlay"></script>
-  <script src="/static/editor.js?v=20260828-overlay-link"></script>
+  <script src="/static/page-list.js?v=20260831-page-management"></script>
+  <script src="/static/editor.js?v=20260831-page-management"></script>
 </body>
 </html>

@@ -27,6 +27,10 @@
         </div>
         <nav class="player-nav" aria-label="页面导航">
           <div class="player-nav-heading">全部页面 <span id="playerPageCount" class="count-pill">0</span></div>
+          <div class="page-search player-page-search">
+            <input id="playerPageSearchInput" type="search" autocomplete="off" placeholder="按名称搜索页面" aria-label="按名称搜索页面" />
+            <button id="playerPageSearchClear" type="button" aria-label="清空页面搜索" title="清空" hidden>×</button>
+          </div>
           <div id="playerPageList" class="player-page-list"></div>
         </nav>
         <div class="player-menu-footer"><kbd>ESC</kbd><span>关闭菜单</span></div>
@@ -35,6 +39,7 @@
   </div>
   <script src="/static/frame-fit.js?v=20260828-fullscreen-overlay"></script>
   <script src="/static/player-navigation.js?v=20260828-page-transition"></script>
-  <script src="/static/player.js?v=20260828-overlay-link"></script>
+  <script src="/static/page-list.js?v=20260831-page-management"></script>
+  <script src="/static/player.js?v=20260831-page-management"></script>
 </body>
 </html>
