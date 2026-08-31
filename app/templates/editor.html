@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{{ project.name }} · UI Prototype Manager</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260828-overlay-link" />
+  <link rel="stylesheet" href="/static/app.css?v=20260831-external-link" />
 </head>
 <body class="editor-body">
   <div id="app" data-project-id="{{ project.id }}" class="editor-shell">
@@ -59,7 +59,7 @@
         <div id="renderSettingsPanel" class="render-settings-panel"></div>
       </section>
       <div class="panel-heading">交互配置</div>
-      <div id="selectionPanel" class="selection-panel muted-panel">选择 HTML 元素或框选图片区域后，在这里命名，并设置“跳转页面”或“返回上一页”。</div>
+      <div id="selectionPanel" class="selection-panel muted-panel">选择 HTML 元素或框选图片区域后，在这里命名，并设置页面跳转、外部网页或返回上一页。</div>
       <div class="panel-heading interactions-heading">当前页交互 <span id="interactionCount" class="count-pill">0</span></div>
       <div id="interactionList" class="interaction-list"></div>
     </aside>
@@ -138,6 +138,6 @@
 
   <script src="/static/frame-fit.js?v=20260827-media-overlay"></script>
   <script src="/static/page-list.js?v=20260831-page-management"></script>
-  <script src="/static/editor.js?v=20260831-page-management"></script>
+  <script src="/static/editor.js?v=20260831-external-link"></script>
 </body>
 </html>

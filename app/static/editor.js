@@ -130,11 +130,14 @@ function interactionView(interaction) {
     name: selection.name,
     action: selection.action,
     target_page_id: selection.targetId || null,
+    target_url: selection.externalUrl || null,
   };
 }
 
 function actionLabel(interaction) {
-  return interaction.action === 'back' ? '↩ 返回上一页' : `→ ${pageName(interaction.target_page_id)}`;
+  if (interaction.action === 'back') return '↩ 返回上一页';
+  if (interaction.action === 'external') return `↗ ${interaction.target_url || '外部网页'}`;
+  return `→ ${pageName(interaction.target_page_id)}`;
 }
 
 function elementDescription(interaction) {
@@ -154,6 +157,7 @@ function selectionForInteraction(interaction, label = '') {
     name: interaction.name,
     action: interaction.action,
     targetId: interaction.target_page_id || '',
+    externalUrl: interaction.target_url || '',
     dirty: false,
   };
 }
@@ -1386,6 +1390,7 @@ function endDraw(event) {
     name: suggestInteractionName(),
     action: 'navigate',
     targetId: '',
+    externalUrl: '',
     dirty: true,
   };
   hoveredInteractionId = null;
@@ -1489,6 +1494,7 @@ function createElementSelection(data) {
     name: suggestInteractionName(),
     action: 'navigate',
     targetId: '',
+    externalUrl: '',
     dirty: true,
   };
   hoveredInteractionId = null;
@@ -1557,7 +1563,7 @@ function suggestInteractionName() {
 function renderSelection() {
   if (!selection) {
     selectionPanel.className = 'selection-panel muted-panel';
-    selectionPanel.textContent = '选择 HTML 元素或图片区域后，可在这里编辑名称、动作和目标页面；画布与下方列表会同步高亮。';
+    selectionPanel.textContent = '选择 HTML 元素或图片区域后，可在这里编辑名称、动作和跳转目标；画布与下方列表会同步高亮。';
     return;
   }
 
@@ -1577,11 +1583,17 @@ function renderSelection() {
     <label for="actionSelect">动作</label>
     <select id="actionSelect">
       <option value="navigate" ${selection.action === 'navigate' ? 'selected' : ''}>跳转到指定页面</option>
+      <option value="external" ${selection.action === 'external' ? 'selected' : ''}>跳转到外部网页</option>
       <option value="back" ${selection.action === 'back' ? 'selected' : ''}>返回上一页</option>
     </select>
     <div id="targetField">
       <label for="targetSelect">目标页面</label>
       <select id="targetSelect"><option value="">请选择目标页面</option>${options}</select>
+    </div>
+    <div id="externalField" hidden>
+      <label for="externalUrlInput">外部网页链接</label>
+      <input id="externalUrlInput" type="url" maxlength="2048" autocomplete="off" placeholder="https://example.com" value="${esc(selection.externalUrl)}">
+      <p class="dialog-note">预览时将在当前页面全屏打开；若目标网站禁止 iframe，页面可能为空白，仍可使用右上角返回控件。</p>
     </div>
     <div id="backHint" class="dialog-note" hidden>预览时调用真实访问历史，效果与顶部“← 返回”完全一致。</div>
     <div class="selection-actions">
@@ -1593,11 +1605,15 @@ function renderSelection() {
   const actionSelect = document.getElementById('actionSelect');
   const targetSelect = document.getElementById('targetSelect');
   const targetField = document.getElementById('targetField');
+  const externalField = document.getElementById('externalField');
+  const externalUrlInput = document.getElementById('externalUrlInput');
   const backHint = document.getElementById('backHint');
 
   const syncActionVisibility = () => {
     const isBack = actionSelect.value === 'back';
-    targetField.hidden = isBack;
+    const isExternal = actionSelect.value === 'external';
+    targetField.hidden = isBack || isExternal;
+    externalField.hidden = !isExternal;
     backHint.hidden = !isBack;
   };
 
@@ -1615,6 +1631,11 @@ function renderSelection() {
   });
   targetSelect.addEventListener('change', () => {
     selection.targetId = targetSelect.value;
+    selection.dirty = true;
+    renderInteractions();
+  });
+  externalUrlInput.addEventListener('input', () => {
+    selection.externalUrl = externalUrlInput.value;
     selection.dirty = true;
     renderInteractions();
   });
@@ -1641,6 +1662,17 @@ async function saveInteraction() {
     alert('请选择目标页面');
     return;
   }
+  if (selection.action === 'external') {
+    try {
+      const target = new URL(selection.externalUrl);
+      if (!['http:', 'https:'].includes(target.protocol) || !target.hostname || target.username || target.password) {
+        throw new Error('invalid URL');
+      }
+    } catch (_error) {
+      alert('请输入有效的 HTTP(S) 外部网页链接');
+      return;
+    }
+  }
 
   const button = document.getElementById('saveInteraction');
   button.disabled = true;
@@ -1648,6 +1680,7 @@ async function saveInteraction() {
     name,
     action: selection.action,
     target_page_id: selection.action === 'navigate' ? selection.targetId : null,
+    target_url: selection.action === 'external' ? selection.externalUrl.trim() : null,
   };
   const isNew = selection.isNew;
   let url = `/api/interactions/${selection.interactionId}`;

@@ -63,6 +63,7 @@ OVERLAY_VIDEO_MAX_BYTES = 100 * 1024 * 1024
 OVERLAY_DEFAULT_WIDTH = 0.3
 OVERLAY_MAX_Z_INDEX = 1000
 OVERLAY_URL_MAX_LENGTH = 2048
+INTERACTION_URL_MAX_LENGTH = 2048
 OVERLAY_MEDIA_TYPES = {
     ".png": ("image", "image/png"),
     ".jpg": ("image", "image/jpeg"),
@@ -225,6 +226,80 @@ def ensure_overlay_url_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_interaction_external_schema(conn: sqlite3.Connection) -> None:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'interactions'"
+    ).fetchone()
+    if not row:
+        return
+    normalized_sql = re.sub(r"\s+", "", str(row["sql"] or "").lower())
+    if (
+        "actionin('navigate','back','external')" in normalized_sql
+        and "target_urltext" in normalized_sql
+    ):
+        return
+
+    conn.execute("DROP INDEX IF EXISTS uq_interactions_project_name")
+    conn.execute("DROP INDEX IF EXISTS idx_interactions_project")
+    conn.execute("DROP INDEX IF EXISTS idx_interactions_source")
+    conn.execute("DROP INDEX IF EXISTS idx_interactions_target")
+    conn.execute(
+        "ALTER TABLE interactions RENAME TO interactions_before_external_support"
+    )
+    conn.execute(
+        """
+        CREATE TABLE interactions (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            source_page_id TEXT NOT NULL,
+            action TEXT NOT NULL CHECK(action IN ('navigate', 'back', 'external')),
+            target_page_id TEXT,
+            target_url TEXT,
+            kind TEXT NOT NULL CHECK(kind IN ('element', 'region')),
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            CHECK (
+                (action = 'back' AND target_page_id IS NULL AND target_url IS NULL)
+                OR (action = 'navigate' AND target_page_id IS NOT NULL AND target_url IS NULL)
+                OR (action = 'external' AND target_page_id IS NULL AND target_url IS NOT NULL)
+            ),
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+            FOREIGN KEY(source_page_id) REFERENCES pages(id) ON DELETE CASCADE,
+            FOREIGN KEY(target_page_id) REFERENCES pages(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO interactions(
+            id, project_id, name, source_page_id, action, target_page_id,
+            target_url, kind, payload_json, created_at
+        )
+        SELECT
+            id, project_id, name, source_page_id, action, target_page_id,
+            NULL, kind, payload_json, created_at
+        FROM interactions_before_external_support
+        """
+    )
+    conn.execute("DROP TABLE interactions_before_external_support")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX uq_interactions_project_name
+        ON interactions(project_id, name COLLATE NOCASE)
+        """
+    )
+    conn.execute(
+        "CREATE INDEX idx_interactions_project ON interactions(project_id, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_interactions_source ON interactions(source_page_id)"
+    )
+    conn.execute(
+        "CREATE INDEX idx_interactions_target ON interactions(target_page_id)"
+    )
+
+
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ASSET_DIR.mkdir(parents=True, exist_ok=True)
@@ -268,12 +343,17 @@ def init_db() -> None:
                 project_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 source_page_id TEXT NOT NULL,
-                action TEXT NOT NULL CHECK(action IN ('navigate', 'back')),
+                action TEXT NOT NULL CHECK(action IN ('navigate', 'back', 'external')),
                 target_page_id TEXT,
+                target_url TEXT,
                 kind TEXT NOT NULL CHECK(kind IN ('element', 'region')),
                 payload_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                CHECK ((action = 'back' AND target_page_id IS NULL) OR (action = 'navigate' AND target_page_id IS NOT NULL)),
+                CHECK (
+                    (action = 'back' AND target_page_id IS NULL AND target_url IS NULL)
+                    OR (action = 'navigate' AND target_page_id IS NOT NULL AND target_url IS NULL)
+                    OR (action = 'external' AND target_page_id IS NULL AND target_url IS NOT NULL)
+                ),
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
                 FOREIGN KEY(source_page_id) REFERENCES pages(id) ON DELETE CASCADE,
                 FOREIGN KEY(target_page_id) REFERENCES pages(id) ON DELETE CASCADE
@@ -321,6 +401,8 @@ def init_db() -> None:
             """
         )
         ensure_overlay_url_schema(conn)
+        ensure_interaction_external_schema(conn)
+        conn.execute("PRAGMA optimize")
         page_columns = {
             str(row["name"])
             for row in conn.execute("PRAGMA table_info(pages)").fetchall()
@@ -645,6 +727,7 @@ class InteractionCreate(BaseModel):
     source_page_id: str
     action: str
     target_page_id: str | None = None
+    target_url: str | None = None
     kind: str
     payload: dict[str, Any]
 
@@ -653,6 +736,7 @@ class InteractionUpdate(BaseModel):
     name: str | None = None
     action: str | None = None
     target_page_id: str | None = None
+    target_url: str | None = None
 
 
 class OverlayUpdate(BaseModel):
@@ -2645,29 +2729,62 @@ def normalize_interaction_payload(kind: str, payload: dict[str, Any]) -> dict[st
     raise HTTPException(400, "Invalid interaction kind")
 
 
+def normalize_interaction_url(value: str | None) -> str:
+    url = str(value or "").strip()
+    if not url:
+        raise HTTPException(400, "target_url is required for external action")
+    if len(url) > INTERACTION_URL_MAX_LENGTH:
+        raise HTTPException(400, "target_url is too long")
+    if any(character in url for character in ("\r", "\n", "\t")):
+        raise HTTPException(400, "target_url is invalid")
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise HTTPException(400, "target_url is invalid") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(400, "target_url must be an absolute HTTP(S) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise HTTPException(400, "target_url must not contain credentials")
+    hostname = parsed.hostname
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    authority = hostname
+    if port is not None:
+        authority += f":{port}"
+    return urlunsplit(
+        (parsed.scheme.lower(), authority, parsed.path, parsed.query, parsed.fragment)
+    )
+
+
 def normalize_interaction_action(
     source: dict[str, Any],
     action: str,
     target_page_id: str | None,
-) -> tuple[str, str | None]:
+    target_url: str | None,
+) -> tuple[str, str | None, str | None]:
     normalized_action = str(action or "").strip().lower()
-    if normalized_action not in {"navigate", "back"}:
-        raise HTTPException(400, "action must be navigate or back")
+    if normalized_action not in {"navigate", "back", "external"}:
+        raise HTTPException(400, "action must be navigate, back, or external")
     if normalized_action == "back":
-        return normalized_action, None
+        return normalized_action, None, None
+    if normalized_action == "external":
+        return normalized_action, None, normalize_interaction_url(target_url)
     if not target_page_id:
         raise HTTPException(400, "target_page_id is required for navigate action")
     target = get_page(target_page_id)
     if source["project_id"] != target["project_id"]:
         raise HTTPException(400, "Target page must be in the same project")
-    return normalized_action, target["id"]
+    return normalized_action, target["id"], None
 
 
 @app.post("/api/interactions")
 def api_create_interaction(payload: InteractionCreate):
     name = clean_name(payload.name, kind="Interaction")
     source = get_page(payload.source_page_id)
-    action, target_page_id = normalize_interaction_action(source, payload.action, payload.target_page_id)
+    action, target_page_id, target_url = normalize_interaction_action(
+        source, payload.action, payload.target_page_id, payload.target_url
+    )
     project_id = source["project_id"]
     normalized = normalize_interaction_payload(payload.kind, payload.payload)
     interaction_id = str(uuid.uuid4())
@@ -2699,17 +2816,25 @@ def api_create_interaction(payload: InteractionCreate):
         try:
             conn.execute(
                 """
-                INSERT INTO interactions(id, project_id, name, source_page_id, action, target_page_id, kind, payload_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO interactions(
+                    id, project_id, name, source_page_id, action, target_page_id,
+                    target_url, kind, payload_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (interaction_id, project_id, name, payload.source_page_id, action, target_page_id, payload.kind, json.dumps(normalized, ensure_ascii=False), now_iso()),
+                (
+                    interaction_id, project_id, name, payload.source_page_id,
+                    action, target_page_id, target_url, payload.kind,
+                    json.dumps(normalized, ensure_ascii=False), now_iso(),
+                ),
             )
         except sqlite3.IntegrityError as exc:
             raise duplicate_error("交互", name) from exc
 
     return {
         "id": interaction_id, "project_id": project_id, "name": name,
-        "source_page_id": payload.source_page_id, "action": action, "target_page_id": target_page_id,
+        "source_page_id": payload.source_page_id, "action": action,
+        "target_page_id": target_page_id, "target_url": target_url,
         "kind": payload.kind, "payload": normalized,
     }
 
@@ -2722,12 +2847,23 @@ def api_update_interaction(interaction_id: str, payload: InteractionUpdate):
         updates["name"] = clean_name(payload.name, kind="Interaction")
 
     fields_set = payload.model_fields_set
-    if payload.action is not None or "target_page_id" in fields_set:
+    if (
+        payload.action is not None
+        or "target_page_id" in fields_set
+        or "target_url" in fields_set
+    ):
         source = get_page(interaction["source_page_id"])
         next_action = payload.action if payload.action is not None else interaction["action"]
         next_target = payload.target_page_id if "target_page_id" in fields_set else interaction["target_page_id"]
-        action, target_page_id = normalize_interaction_action(source, next_action, next_target)
-        updates.update(action=action, target_page_id=target_page_id)
+        next_url = payload.target_url if "target_url" in fields_set else interaction["target_url"]
+        action, target_page_id, target_url = normalize_interaction_action(
+            source, next_action, next_target, next_url
+        )
+        updates.update(
+            action=action,
+            target_page_id=target_page_id,
+            target_url=target_url,
+        )
 
     if not updates:
         raise HTTPException(400, "No interaction fields to update")

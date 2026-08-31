@@ -4,11 +4,29 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{{ project.name }} · Preview</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260828-page-transition" />
+  <link rel="stylesheet" href="/static/app.css?v=20260831-external-link" />
 </head>
 <body class="player-body">
   <div id="player" data-project-id="{{ project.id }}" class="player-shell">
     <main id="playerStage" class="player-stage" tabindex="-1"></main>
+    <section id="externalLayer" class="player-external-layer" aria-label="外部网页" hidden inert>
+      <iframe
+        id="externalFrame"
+        class="player-external-frame"
+        title="外部网页"
+        referrerpolicy="no-referrer"
+        sandbox="allow-downloads allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts"
+      ></iframe>
+      <div id="externalStatus" class="player-external-status" role="status" aria-live="polite" hidden></div>
+      <div class="player-external-return-dock">
+        <button id="externalReturnBtn" class="player-external-return" type="button" aria-label="返回原型页面" title="返回原型页面">
+          <span class="player-external-return-icon" aria-hidden="true">←</span>
+          <span class="player-external-return-copy">
+            <strong>返回</strong>
+          </span>
+        </button>
+      </div>
+    </section>
     <div id="playerMenuLayer" class="player-menu-layer" aria-hidden="true" inert>
       <div id="playerMenuBackdrop" class="player-menu-backdrop" aria-hidden="true"></div>
       <aside class="player-menu" role="dialog" aria-modal="true" aria-labelledby="playerMenuTitle">
@@ -40,6 +58,6 @@
   <script src="/static/frame-fit.js?v=20260828-fullscreen-overlay"></script>
   <script src="/static/player-navigation.js?v=20260828-page-transition"></script>
   <script src="/static/page-list.js?v=20260831-page-management"></script>
-  <script src="/static/player.js?v=20260831-page-management"></script>
+  <script src="/static/player.js?v=20260831-external-link"></script>
 </body>
 </html>

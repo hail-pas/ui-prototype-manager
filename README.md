@@ -15,7 +15,8 @@
 - 图片：拖拽框选 Hotspot 创建交互
 - HTML 元素与图片 Hotspot 会在编辑器画布中常驻显示区域和交互名称
 - 画布标注与右侧交互列表双向选择、高亮和定位，右侧可直接编辑完整交互配置
-- 每个交互可选择 **跳转到指定页面** 或 **返回上一页**
+- 每个交互可选择 **跳转到指定页面**、**跳转到外部网页** 或 **返回上一页**
+- 外部网页在 Preview 当前页面的全屏 iframe 中打开；右上角提供默认收起、悬停展开的返回控件
 - “返回上一页”与 Preview 顶部“← 返回”调用同一访问历史栈，不绑定固定页面
 - 每条交互创建时必须命名，创建后可继续重命名
 - 同一项目内 **交互名称单独唯一**，大小写不敏感
@@ -253,10 +254,12 @@ home 与 HOME 视为重复
 6. HTML：点击元素；图片：拖拽框选区域。已保存交互会在画布中显示名称和区域。
 7. 点击画布标注或右侧交互条目可以双向高亮；在右侧输入唯一交互名称，并选择动作：
    - **跳转到指定页面**：选择目标页面；
+   - **跳转到外部网页**：输入绝对的 HTTP(S) 链接；
    - **返回上一页**：不选择目标页面，运行时使用真实访问历史。
 8. 页面可通过 `✎` 重命名；交互可在右侧配置区修改名称、动作和目标页面。
 9. 点击“预览”。
 10. 左侧页面列表可折叠，点击页面会进入访问历史；顶部“← 返回”和页面内“返回上一页”交互完全一致。
+11. 外部网页会覆盖当前 Preview；鼠标移到右上角边缘的返回图标后可展开并返回原型。外部网站禁止 iframe 或加载失败时，仍可正常返回。
 
 ## 7. 返回交互语义
 
@@ -294,16 +297,17 @@ Project
  └─ Interaction
      ├─ name              项目内交互唯一
      ├─ source_page_id
-     ├─ action            navigate / back
-     ├─ target_page_id    navigate 时必填，back 时为空
+     ├─ action            navigate / external / back
+     ├─ target_page_id    navigate 时必填，其他动作为空
+     ├─ target_url        external 时必填，其他动作为空
      ├─ kind              element / region
      └─ payload
 ```
 
-删除 Page 时，SQLite `ON DELETE CASCADE` 会删除从该页面发出的所有 Interaction，以及以该页面为目标的 `navigate` Interaction；其他页面上的 `back` Interaction 因不依赖固定目标页而不会受影响。
+删除 Page 时，SQLite `ON DELETE CASCADE` 会删除从该页面发出的所有 Interaction，以及以该页面为目标的 `navigate` Interaction；其他页面上的 `back` 和 `external` Interaction 因不依赖固定目标页而不会受影响。
 
 ## 9. 当前边界
 
 ZIP 页面包必须在根目录或唯一的单层包装目录中包含 `index.html`，且一个 ZIP 只包含一个 HTML 文件；包内相对 CSS/JS/图片/字体/音视频资源会保留目录结构。暂不支持以 `/` 开头的站点根路径、多 HTML 文档页面包、HTML/CSS/JS 编辑、组件拖拽、页面排序、多人账号、复杂权限、版本控制、条件跳转、动画转场、跨项目跳转、S3 Bucket 自动创建。
 
-上传 HTML 使用 `sandbox="allow-scripts"` iframe。如果未来允许不可信外部用户上传 HTML，建议增加独立资源域、HTML 清洗和更严格 CSP。
+上传 HTML 使用 `sandbox="allow-scripts"` iframe。如果未来允许不可信外部用户上传 HTML，建议增加独立资源域、HTML 清洗和更严格 CSP。外部网页是否能在 Preview 中显示由目标站点的 `X-Frame-Options`、CSP `frame-ancestors` 等安全策略决定；被阻止时应用不会绕过目标站点限制。

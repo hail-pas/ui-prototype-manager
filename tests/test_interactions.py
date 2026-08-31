@@ -121,6 +121,119 @@ class InteractionUpdateTests(unittest.TestCase):
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(main.get_interaction(interaction["id"])["name"], "Open target")
 
+    def test_creates_and_updates_external_link_interaction(self) -> None:
+        interaction = main.api_create_interaction(
+            main.InteractionCreate(
+                name="Open documentation",
+                source_page_id="source",
+                action="external",
+                target_url="HTTPS://EXAMPLE.COM/docs#start",
+                kind="region",
+                payload={"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4},
+            )
+        )
+
+        self.assertEqual(interaction["action"], "external")
+        self.assertIsNone(interaction["target_page_id"])
+        self.assertEqual(interaction["target_url"], "https://example.com/docs#start")
+
+        updated = main.api_update_interaction(
+            interaction["id"],
+            main.InteractionUpdate(
+                action="navigate",
+                target_page_id="target-a",
+                target_url=None,
+            ),
+        )
+
+        self.assertEqual(updated["action"], "navigate")
+        self.assertEqual(updated["target_page_id"], "target-a")
+        self.assertIsNone(updated["target_url"])
+
+    def test_rejects_unsafe_external_link_urls(self) -> None:
+        for index, url in enumerate(
+            (
+                "javascript:alert(1)",
+                "/relative/path",
+                "https://user:password@example.com/private",
+            )
+        ):
+            with self.subTest(url=url), self.assertRaises(HTTPException) as raised:
+                main.api_create_interaction(
+                    main.InteractionCreate(
+                        name=f"Unsafe link {index}",
+                        source_page_id="source",
+                        action="external",
+                        target_url=url,
+                        kind="region",
+                        payload={"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4},
+                    )
+                )
+            self.assertEqual(raised.exception.status_code, 400)
+
+    def test_init_db_migrates_existing_interactions_for_external_links(self) -> None:
+        created_at = main.now_iso()
+        with main.db() as connection:
+            connection.execute("DROP INDEX uq_interactions_project_name")
+            connection.execute("DROP INDEX idx_interactions_project")
+            connection.execute("DROP INDEX idx_interactions_source")
+            connection.execute("DROP INDEX idx_interactions_target")
+            connection.execute("DROP TABLE interactions")
+            connection.execute(
+                """
+                CREATE TABLE interactions (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    source_page_id TEXT NOT NULL,
+                    action TEXT NOT NULL CHECK(action IN ('navigate', 'back')),
+                    target_page_id TEXT,
+                    kind TEXT NOT NULL CHECK(kind IN ('element', 'region')),
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    CHECK (
+                        (action = 'back' AND target_page_id IS NULL)
+                        OR (action = 'navigate' AND target_page_id IS NOT NULL)
+                    ),
+                    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                    FOREIGN KEY(source_page_id) REFERENCES pages(id) ON DELETE CASCADE,
+                    FOREIGN KEY(target_page_id) REFERENCES pages(id) ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO interactions(
+                    id, project_id, name, source_page_id, action, target_page_id,
+                    kind, payload_json, created_at
+                ) VALUES (?, 'project-a', 'Legacy link', 'source', 'navigate',
+                    'target-a', 'region', ?, ?)
+                """,
+                (
+                    "legacy-interaction",
+                    '{"x":0.1,"y":0.2,"width":0.3,"height":0.4}',
+                    created_at,
+                ),
+            )
+
+        main.init_db()
+
+        migrated = main.get_interaction("legacy-interaction")
+        self.assertEqual(migrated["action"], "navigate")
+        self.assertEqual(migrated["target_page_id"], "target-a")
+        self.assertIsNone(migrated["target_url"])
+        external = main.api_create_interaction(
+            main.InteractionCreate(
+                name="New external link",
+                source_page_id="source",
+                action="external",
+                target_url="https://example.com",
+                kind="region",
+                payload={"x": 0.5, "y": 0.2, "width": 0.2, "height": 0.2},
+            )
+        )
+        self.assertEqual(external["action"], "external")
+
 
 class InjectedEditorTests(unittest.TestCase):
     def test_static_document_contains_bidirectional_overlay_protocol(self) -> None:
@@ -173,6 +286,27 @@ class PlayerOverlayTests(unittest.TestCase):
         self.assertIn("inspectOverlayLink(url, type)", editor_script)
         self.assertIn("/overlays/from-url", editor_script)
         self.assertIn("media.referrerPolicy = 'no-referrer';", editor_script)
+
+    def test_external_links_render_in_a_full_page_frame_with_return_fallback(self) -> None:
+        static_dir = Path(main.__file__).parent / "static"
+        template_dir = Path(main.__file__).parent / "templates"
+        player_script = (static_dir / "player.js").read_text(encoding="utf-8")
+        stylesheet = (static_dir / "app.css").read_text(encoding="utf-8")
+        player_template = (template_dir / "player.html").read_text(encoding="utf-8")
+        editor_script = (static_dir / "editor.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="externalLayer"', player_template)
+        self.assertIn('id="externalFrame"', player_template)
+        self.assertIn('id="externalReturnBtn"', player_template)
+        self.assertIn("function openExternalPage(url)", player_script)
+        self.assertIn("function closeExternalPage()", player_script)
+        self.assertIn("interaction.action === 'external'", player_script)
+        self.assertIn("可能加载较慢或被安全策略阻止", player_script)
+        self.assertIn(".player-external-return-dock:hover", stylesheet)
+        self.assertIn("width:32px;overflow:hidden", stylesheet)
+        self.assertIn(".player-external-return-icon", stylesheet)
+        self.assertNotIn("页面空白时也可返回原型", player_template)
+        self.assertIn('value="external"', editor_script)
 
 
 class HtmlInstrumentationUpgradeTests(unittest.TestCase):

@@ -11,6 +11,10 @@ const pageNameElement = document.getElementById('playerPageName');
 const menuLayer = document.getElementById('playerMenuLayer');
 const menuBackdrop = document.getElementById('playerMenuBackdrop');
 const menuCloseBtn = document.getElementById('menuCloseBtn');
+const externalLayer = document.getElementById('externalLayer');
+const externalFrame = document.getElementById('externalFrame');
+const externalStatus = document.getElementById('externalStatus');
+const externalReturnBtn = document.getElementById('externalReturnBtn');
 
 const PAGE_READY_TIMEOUT_MS = 15_000;
 const PAGE_LOADING_DELAY_MS = 250;
@@ -18,6 +22,8 @@ const PAGE_ERROR_VISIBLE_MS = 5_000;
 const PAGE_TRANSITION_MS = 140;
 const PAGE_CACHE_TTL_MS = 30_000;
 const HOTSPOT_REVEAL_MS = 500;
+const EXTERNAL_LOADING_TIMEOUT_MS = 12_000;
+const EXTERNAL_HINT_VISIBLE_MS = 4_500;
 
 let state = {pages: [], interactions: [], overlays: []};
 let currentPageId = null;
@@ -30,6 +36,9 @@ let previewFocusTarget = null;
 let transitionStatus = null;
 let transitionStatusTimer = null;
 let transitionStatusHideTimer = null;
+let externalOpen = false;
+let externalLoadTimer = null;
+let externalHintTimer = null;
 const pageViews = new Set();
 const contentUrlRefreshes = new Map();
 const hotspotRevealTimers = new WeakMap();
@@ -75,7 +84,7 @@ function setMenuOpen(open) {
   root.classList.toggle('menu-open', menuOpen);
   menuLayer.inert = !menuOpen;
   menuLayer.setAttribute('aria-hidden', String(!menuOpen));
-  stage.inert = menuOpen;
+  stage.inert = menuOpen || externalOpen;
   if (menuOpen) requestAnimationFrame(() => menuCloseBtn.focus({preventScroll: true}));
   else restorePreviewFocus();
 }
@@ -83,6 +92,70 @@ function setMenuOpen(open) {
 function toggleMenu() {
   setMenuOpen(!menuOpen);
 }
+
+function showExternalStatus(message, warning = false) {
+  window.clearTimeout(externalHintTimer);
+  externalStatus.textContent = message;
+  externalStatus.classList.toggle('is-warning', warning);
+  externalStatus.hidden = false;
+}
+
+function hideExternalStatus() {
+  window.clearTimeout(externalHintTimer);
+  externalStatus.hidden = true;
+  externalStatus.classList.remove('is-warning');
+  externalStatus.textContent = '';
+}
+
+function closeExternalPage() {
+  if (!externalOpen) return false;
+  externalOpen = false;
+  window.clearTimeout(externalLoadTimer);
+  window.clearTimeout(externalHintTimer);
+  externalLayer.hidden = true;
+  externalLayer.inert = true;
+  externalFrame.src = 'about:blank';
+  hideExternalStatus();
+  stage.inert = menuOpen;
+  restorePreviewFocus();
+  return true;
+}
+
+function openExternalPage(url) {
+  let target;
+  try {
+    target = new URL(url);
+  } catch (_error) {
+    return;
+  }
+  if (!['http:', 'https:'].includes(target.protocol)) return;
+
+  setMenuOpen(false);
+  externalOpen = true;
+  externalLayer.hidden = false;
+  externalLayer.inert = false;
+  stage.inert = true;
+  showExternalStatus('正在打开外部网页…');
+  window.clearTimeout(externalLoadTimer);
+  externalLoadTimer = window.setTimeout(() => {
+    if (!externalOpen) return;
+    showExternalStatus('目标网页暂未显示，可能加载较慢或被安全策略阻止；右上角仍可返回。', true);
+  }, EXTERNAL_LOADING_TIMEOUT_MS);
+  externalFrame.src = target.href;
+}
+
+externalFrame.addEventListener('load', () => {
+  if (!externalOpen || externalFrame.src === 'about:blank') return;
+  window.clearTimeout(externalLoadTimer);
+  showExternalStatus('若页面为空白，可能是目标网站禁止 iframe；可使用右上角返回按钮。');
+  externalHintTimer = window.setTimeout(hideExternalStatus, EXTERNAL_HINT_VISIBLE_MS);
+});
+
+externalFrame.addEventListener('error', () => {
+  if (!externalOpen) return;
+  window.clearTimeout(externalLoadTimer);
+  showExternalStatus('外部网页加载失败或被安全策略阻止；右上角仍可返回。', true);
+});
 
 function setFullscreenButtonLabel(label) {
   fullscreenBtn.textContent = label;
@@ -374,9 +447,9 @@ function appendImageHotspots(container, pageId) {
     const hotspot = document.createElement('button');
     hotspot.className = 'player-hotspot';
     hotspot.type = 'button';
-    hotspot.title = interaction.action === 'back'
-      ? '返回上一页'
-      : `跳转到 ${page(interaction.target_page_id)?.name || ''}`;
+    if (interaction.action === 'back') hotspot.title = '返回上一页';
+    else if (interaction.action === 'external') hotspot.title = `打开外部网页 ${interaction.target_url || ''}`;
+    else hotspot.title = `跳转到 ${page(interaction.target_page_id)?.name || ''}`;
     Object.assign(hotspot.style, {
       left: `${region.x * 100}%`,
       top: `${region.y * 100}%`,
@@ -715,6 +788,10 @@ function executeInteraction(interaction) {
   }
   if (interaction.action === 'navigate' && interaction.target_page_id) {
     navigate(interaction.target_page_id);
+    return;
+  }
+  if (interaction.action === 'external' && interaction.target_url) {
+    openExternalPage(interaction.target_url);
   }
 }
 
@@ -764,6 +841,7 @@ window.addEventListener('message', (event) => {
   }
   if (owner !== activeView || owner.pageId !== currentPageId) return;
   if (data.type === 'uipm-preview-key' && data.key === 'Escape') {
+    if (closeExternalPage()) return;
     toggleMenu();
     return;
   }
@@ -778,6 +856,7 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
     if (event.repeat) return;
     event.preventDefault();
+    if (closeExternalPage()) return;
     toggleMenu();
     return;
   }
@@ -806,6 +885,7 @@ fullscreenBtn.addEventListener('click', () => void toggleFullscreen());
 document.addEventListener('fullscreenchange', syncFullscreenState);
 menuCloseBtn.addEventListener('click', () => setMenuOpen(false));
 menuBackdrop.addEventListener('click', () => setMenuOpen(false));
+externalReturnBtn.addEventListener('click', closeExternalPage);
 pageSearchInput.addEventListener('input', () => renderPageList(navigation?.getState().pendingPageId));
 pageSearchClear.addEventListener('click', () => {
   pageSearchInput.value = '';
