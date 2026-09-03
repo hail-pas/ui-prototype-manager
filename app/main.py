@@ -36,6 +36,7 @@ from app.object_storage import (
     object_storage,
     object_storage_settings,
 )
+from app.page_management import router as page_management_router
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 APP_DIR = BASE_DIR / "app"
@@ -76,6 +77,7 @@ OVERLAY_MEDIA_TYPES = {
 STREAM_CHUNK_BYTES = 1024 * 1024
 
 app = FastAPI(title="UI Prototype Manager", version="0.5.0")
+app.include_router(page_management_router)
 app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=APP_DIR / "templates")
 
