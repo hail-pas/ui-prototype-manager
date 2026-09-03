@@ -13,6 +13,7 @@
   const renameNote = renameForm?.querySelector('.dialog-note');
   const defaultRenameNote = renameNote?.textContent || '';
   let pageActionDialog = null;
+  let deleteDialogResolve = null;
 
   function cleanName(value) {
     return String(value || '').trim().replace(/\s+/g, ' ');
@@ -51,8 +52,6 @@
   }
 
   if (renameForm && renameDialog && renameInput) {
-    // editor.js already owns this dialog for normal page/interaction renaming.
-    // Intercept submit only while one of the extra page actions opened it.
     renameForm.addEventListener('submit', async (event) => {
       if (!renameDialog.dataset.pageActionMode || !pageActionDialog) return;
       event.preventDefault();
@@ -86,9 +85,100 @@
       if (!renameDialog.dataset.pageActionMode) return;
       delete renameDialog.dataset.pageActionMode;
       pageActionDialog = null;
-      if (renameTitle) renameTitle.textContent = '重命名';
+      renameTitle.textContent = '重命名';
       if (renameNote) renameNote.textContent = defaultRenameNote;
     });
+  }
+
+  function ensureDeleteDialog() {
+    let dialog = document.getElementById('pageActionDeleteDialog');
+    if (dialog) return dialog;
+
+    dialog = document.createElement('dialog');
+    dialog.id = 'pageActionDeleteDialog';
+    dialog.className = 'dialog compact-dialog';
+    dialog.innerHTML = `
+      <form method="dialog">
+        <h2>确认删除</h2>
+        <p class="page-action-delete-text"></p>
+        <div class="dialog-actions">
+          <button type="button" class="ghost-btn page-action-delete-cancel">取消</button>
+          <button type="button" class="danger-btn page-action-delete-ok">删除</button>
+        </div>
+      </form>`;
+    document.body.appendChild(dialog);
+
+    const settle = (result) => {
+      const resolve = deleteDialogResolve;
+      deleteDialogResolve = null;
+      if (dialog.open) dialog.close();
+      if (resolve) resolve(result);
+    };
+
+    dialog.querySelector('.page-action-delete-cancel').addEventListener('click', () => settle(false));
+    dialog.querySelector('.page-action-delete-ok').addEventListener('click', () => settle(true));
+    dialog.addEventListener('cancel', (event) => {
+      event.preventDefault();
+      settle(false);
+    });
+    dialog.addEventListener('close', () => {
+      if (!deleteDialogResolve) return;
+      const resolve = deleteDialogResolve;
+      deleteDialogResolve = null;
+      resolve(false);
+    });
+    return dialog;
+  }
+
+  function confirmDelete(message) {
+    const dialog = ensureDeleteDialog();
+    dialog.querySelector('.page-action-delete-text').textContent = message;
+    if (dialog.open) dialog.close();
+    dialog.showModal();
+    return new Promise((resolve) => {
+      deleteDialogResolve = resolve;
+    });
+  }
+
+  function installStyledDeleteConfirmations() {
+    document.addEventListener('click', async (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target) return;
+
+      const interactionButton = target.closest('.delete-interaction');
+      const overlayButton = target.closest('.delete-overlay');
+      if (!interactionButton && !overlayButton) return;
+
+      event.preventDefault();
+      event.stopImmediatePropagation();
+
+      const button = interactionButton || overlayButton;
+      const isInteraction = Boolean(interactionButton);
+      const id = isInteraction
+        ? interactionButton.dataset.id
+        : overlayButton.closest('.overlay-list-item')?.dataset.id;
+      if (!id) return;
+
+      const ariaLabel = cleanName(button.getAttribute('aria-label'));
+      const name = ariaLabel.replace(/^删除\s*/, '') || (isInteraction ? '该交互' : '该页面元素');
+      const message = isInteraction
+        ? `删除交互“${name}”？删除后不可恢复。`
+        : `删除页面元素“${name}”？底层媒体资源也会同步删除。`;
+      const confirmed = await confirmDelete(message);
+      if (!confirmed) return;
+
+      button.disabled = true;
+      try {
+        await requestJson(
+          isInteraction ? `/api/interactions/${id}` : `/api/overlays/${id}`,
+          {method: 'DELETE'},
+        );
+        location.reload();
+      } catch (error) {
+        button.disabled = false;
+        alert(error.message);
+      }
+    }, true);
   }
 
   function installProjectRename() {
@@ -139,8 +229,6 @@
   }
 
   function installCopyButton(row) {
-    // HTML packages contain page-specific instrumentation, so copying is
-    // intentionally limited to image pages.
     if (pageType(row) !== 'IMG' || row.querySelector('.copy-page')) return;
 
     const pageId = row.dataset.id;
@@ -195,6 +283,7 @@
     pageList.querySelectorAll('.page-item').forEach(enhancePageRow);
   }
 
+  installStyledDeleteConfirmations();
   installProjectRename();
   enhancePageList();
   new MutationObserver(enhancePageList).observe(pageList, {childList: true});
