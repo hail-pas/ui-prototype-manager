@@ -163,7 +163,7 @@
       const name = ariaLabel.replace(/^删除\s*/, '') || (isInteraction ? '该交互' : '该页面元素');
       const message = isInteraction
         ? `删除交互“${name}”？删除后不可恢复。`
-        : `删除页面元素“${name}”？底层媒体资源也会同步删除。`;
+        : `删除页面元素“${name}”？删除后不可恢复。`;
       const confirmed = await confirmDelete(message);
       if (!confirmed) return;
 
