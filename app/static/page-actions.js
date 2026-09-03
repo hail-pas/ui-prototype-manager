@@ -146,7 +146,7 @@
       if (!target) return;
 
       const interactionButton = target.closest('.delete-interaction');
-      const overlayButton = target.closest('.delete-overlay');
+      const overlayButton = target.closest('.delete-overlay, #deleteSelectedOverlay');
       if (!interactionButton && !overlayButton) return;
 
       event.preventDefault();
@@ -154,12 +154,16 @@
 
       const button = interactionButton || overlayButton;
       const isInteraction = Boolean(interactionButton);
+      const activeOverlayRow = document.querySelector('.overlay-list-item.is-active');
       const id = isInteraction
         ? interactionButton.dataset.id
-        : overlayButton.closest('.overlay-list-item')?.dataset.id;
+        : overlayButton.closest('.overlay-list-item')?.dataset.id || activeOverlayRow?.dataset.id;
       if (!id) return;
 
-      const ariaLabel = cleanName(button.getAttribute('aria-label'));
+      const activeOverlayDelete = activeOverlayRow?.querySelector('.delete-overlay');
+      const ariaLabel = cleanName(
+        button.getAttribute('aria-label') || activeOverlayDelete?.getAttribute('aria-label')
+      );
       const name = ariaLabel.replace(/^删除\s*/, '') || (isInteraction ? '该交互' : '该页面元素');
       const message = isInteraction
         ? `删除交互“${name}”？删除后不可恢复。`
