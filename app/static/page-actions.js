@@ -6,6 +6,13 @@
   if (!root || !pageList) return;
 
   const projectId = root.dataset.projectId;
+  const renameDialog = document.getElementById('renameDialog');
+  const renameForm = document.getElementById('renameForm');
+  const renameInput = document.getElementById('renameInput');
+  const renameTitle = document.getElementById('renameTitle');
+  const renameNote = renameForm?.querySelector('.dialog-note');
+  const defaultRenameNote = renameNote?.textContent || '';
+  let pageActionDialog = null;
 
   function cleanName(value) {
     return String(value || '').trim().replace(/\s+/g, ' ');
@@ -28,6 +35,62 @@
     return response.status === 204 ? null : response.json();
   }
 
+  function openNameDialog({mode, title, value, note, submit}) {
+    if (!renameDialog || !renameForm || !renameInput || !renameTitle) return false;
+    pageActionDialog = {mode, submit};
+    renameDialog.dataset.pageActionMode = mode;
+    renameTitle.textContent = title;
+    renameInput.value = value;
+    if (renameNote) renameNote.textContent = note || defaultRenameNote;
+    renameDialog.showModal();
+    requestAnimationFrame(() => {
+      renameInput.focus();
+      renameInput.select();
+    });
+    return true;
+  }
+
+  if (renameForm && renameDialog && renameInput) {
+    // editor.js already owns this dialog for normal page/interaction renaming.
+    // Intercept submit only while one of the extra page actions opened it.
+    renameForm.addEventListener('submit', async (event) => {
+      if (!renameDialog.dataset.pageActionMode || !pageActionDialog) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+
+      const name = cleanName(renameInput.value);
+      if (!name) {
+        alert('请输入名称');
+        renameInput.focus();
+        return;
+      }
+      if (name.length > 120) {
+        alert('名称不能超过 120 个字符');
+        renameInput.focus();
+        return;
+      }
+
+      const submitButton = renameForm.querySelector('button[type="submit"]');
+      if (submitButton) submitButton.disabled = true;
+      try {
+        await pageActionDialog.submit(name);
+        renameDialog.close();
+      } catch (error) {
+        alert(error.message);
+      } finally {
+        if (submitButton) submitButton.disabled = false;
+      }
+    }, true);
+
+    renameDialog.addEventListener('close', () => {
+      if (!renameDialog.dataset.pageActionMode) return;
+      delete renameDialog.dataset.pageActionMode;
+      pageActionDialog = null;
+      if (renameTitle) renameTitle.textContent = '重命名';
+      if (renameNote) renameNote.textContent = defaultRenameNote;
+    });
+  }
+
   function installProjectRename() {
     const wrap = document.querySelector('.project-title-wrap');
     const title = wrap?.querySelector('strong');
@@ -41,29 +104,24 @@
     button.textContent = '✎';
     wrap.appendChild(button);
 
-    button.addEventListener('click', async () => {
+    button.addEventListener('click', () => {
       const currentName = cleanName(title.textContent);
-      const input = window.prompt('修改项目名称', currentName);
-      if (input === null) return;
-      const name = cleanName(input);
-      if (!name) return alert('请输入项目名称');
-      if (name === currentName) return;
-      if (name.length > 120) return alert('项目名称不能超过 120 个字符');
-
-      button.disabled = true;
-      try {
-        const project = await requestJson(`/api/projects/${projectId}`, {
-          method: 'PATCH',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name}),
-        });
-        title.textContent = project.name;
-        document.title = `${project.name} · UI Prototype Manager`;
-      } catch (error) {
-        alert(error.message);
-      } finally {
-        button.disabled = false;
-      }
+      openNameDialog({
+        mode: 'project-rename',
+        title: '修改项目名称',
+        value: currentName,
+        note: '修改后会同步更新当前编辑页的项目标题。',
+        submit: async (name) => {
+          if (name === currentName) return;
+          const project = await requestJson(`/api/projects/${projectId}`, {
+            method: 'PATCH',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name}),
+          });
+          title.textContent = project.name;
+          document.title = `${project.name} · UI Prototype Manager`;
+        },
+      });
     });
   }
 
@@ -97,30 +155,30 @@
     button.setAttribute('aria-label', `复制 ${cleanName(pageNameNode.textContent)}`);
     button.innerHTML = '<span aria-hidden="true">⧉</span>';
 
-    button.addEventListener('click', async (event) => {
+    button.addEventListener('click', (event) => {
       event.stopPropagation();
       const originalName = cleanName(pageNameNode.textContent);
-      const input = window.prompt('复制页面名称', `${originalName} copy`);
-      if (input === null) return;
-      const name = cleanName(input);
-      if (!name) return alert('请输入页面名称');
-      if (name.length > 120) return alert('页面名称不能超过 120 个字符');
-
-      button.disabled = true;
-      button.classList.add('is-busy');
-      try {
-        await requestJson(`/api/pages/${pageId}/duplicate`, {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name}),
-        });
-        location.reload();
-      } catch (error) {
-        alert(error.message);
-      } finally {
-        button.disabled = false;
-        button.classList.remove('is-busy');
-      }
+      openNameDialog({
+        mode: 'page-copy',
+        title: '复制页面',
+        value: `${originalName} copy`,
+        note: '将复制图片页面及其交互和页面元素配置，复制后与原页面相互独立。',
+        submit: async (name) => {
+          button.disabled = true;
+          button.classList.add('is-busy');
+          try {
+            await requestJson(`/api/pages/${pageId}/duplicate`, {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({name}),
+            });
+            location.reload();
+          } finally {
+            button.disabled = false;
+            button.classList.remove('is-busy');
+          }
+        },
+      });
     });
 
     rename.before(button);
