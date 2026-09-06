@@ -1,0 +1,108 @@
+/* Keep the visual stack explicit: page content < overlays < interactions < editor guides. */
+.overlay-layer {
+  z-index: 10;
+}
+
+/*
+ * app.css gives .hotspot.is-active its own z-index. Override every interaction
+ * state explicitly so selecting a region can never move it back below overlays.
+ * Keep fills light so overlapping interactions remain visible at the same time.
+ */
+.hotspot {
+  z-index: 50;
+  background: rgba(37,99,235,.08);
+}
+
+.hotspot:hover,
+.hotspot.is-hovered {
+  z-index: 55;
+  background: rgba(37,99,235,.10);
+}
+
+.hotspot.is-active,
+.hotspot.draft.is-active {
+  z-index: 60;
+  background: rgba(37,99,235,.06);
+}
+
+/*
+ * Unselected overlays stay visually above the page but let region drawing reach
+ * the page stage. Their label remains a small direct-selection affordance; once
+ * selected (from the label or sidebar), the existing drag/resize behavior stays
+ * available.
+ */
+.editor-overlay:not(.is-selected) {
+  pointer-events: none;
+}
+
+.editor-overlay:not(.is-selected) .editor-overlay-label {
+  pointer-events: auto;
+  cursor: grab;
+}
+
+.editor-overlay.is-selected {
+  pointer-events: auto;
+}
+
+/* HTML element markers are mirrored outside the iframe so overlays cannot cover them. */
+.html-interaction-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  overflow: visible;
+  line-height: normal;
+  pointer-events: none;
+}
+
+.html-interaction-marker {
+  position: absolute;
+  z-index: 1;
+  box-sizing: border-box;
+  border: 1px solid rgba(37,99,235,.72);
+  border-radius: 4px;
+  background: rgba(37,99,235,.05);
+  pointer-events: none;
+}
+
+.html-interaction-marker.is-hovered {
+  z-index: 2;
+  border-color: #2563eb;
+  background: rgba(37,99,235,.08);
+}
+
+.html-interaction-marker.is-active {
+  z-index: 3;
+  border: 3px solid #2563eb;
+  background: rgba(37,99,235,.05);
+  box-shadow: 0 0 0 3px rgba(37,99,235,.18);
+}
+
+.html-interaction-marker.is-draft {
+  border-style: dashed;
+}
+
+.html-interaction-marker > span {
+  position: absolute;
+  top: -22px;
+  left: -1px;
+  max-width: 240px;
+  overflow: hidden;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: #2563eb;
+  color: #fff;
+  font: 600 11px/1.35 Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(29,78,216,.24);
+}
+
+/* Player interactions always sit above both image and video overlays. */
+.player-overlay.is-image,
+.player-overlay.is-video {
+  z-index: 10;
+}
+
+.player-hotspot {
+  z-index: 20;
+}

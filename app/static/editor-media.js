@@ -82,7 +82,7 @@
         await refreshPageContentUrl(page);
         if (page.id === currentPageId) loadSource();
       } catch (error) {
-        alert(error.message);
+        void showMessage(error.message);
       }
     });
     loadSource();
@@ -109,9 +109,9 @@
       button.title = '替换主体视频';
       button.setAttribute('aria-label', `替换 ${page.name} 的主体视频`);
       button.textContent = '↻';
-      button.addEventListener('click', (event) => {
+      button.addEventListener('click', async (event) => {
         event.stopPropagation();
-        if (!confirmDiscardSelection()) return;
+        if (!await confirmDiscardSelection()) return;
         replaceVideoPageId = page.id;
         replaceVideoInput.value = '';
         replaceVideoInput.click();
@@ -139,7 +139,7 @@
       if (page.id === currentPageId) renderCanvas();
       renderPageList();
     } catch (error) {
-      alert(error.message);
+      void showMessage(error.message);
     }
   });
 
@@ -151,20 +151,20 @@
 
     const inputs = Array.from(uploadRows.querySelectorAll('.upload-name-input'));
     const names = inputs.map((input) => input.value.trim().replace(/\s+/g, ' '));
-    if (names.some((name) => !name)) return alert('页面名称不能为空');
+    if (names.some((name) => !name)) return showMessage('页面名称不能为空');
     const folded = names.map(norm);
-    if (new Set(folded).size !== folded.length) return alert('本次上传的页面名称存在重复');
+    if (new Set(folded).size !== folded.length) return showMessage('本次上传的页面名称存在重复');
     const existing = new Set(state.pages.map((page) => norm(page.name)));
     const collision = names.find((name) => existing.has(norm(name)));
-    if (collision) return alert(`页面名称“${collision}”在当前项目中已存在`);
+    if (collision) return showMessage(`页面名称“${collision}”在当前项目中已存在`);
 
     const viewportWidth = Number(uploadViewportWidth.value);
     const viewportHeight = Number(uploadViewportHeight.value);
     if (!Number.isInteger(viewportWidth) || viewportWidth < 240 || viewportWidth > 10000) {
-      return alert('设计宽度需在 240–10000 之间');
+      return showMessage('设计宽度需在 240–10000 之间');
     }
     if (!Number.isInteger(viewportHeight) || viewportHeight < 240 || viewportHeight > 10000) {
-      return alert('设计高度需在 240–10000 之间');
+      return showMessage('设计高度需在 240–10000 之间');
     }
 
     const groups = [];
@@ -221,9 +221,9 @@
         try {
           await reload(false);
         } catch {}
-        alert(`${error.message}\n部分页面已上传，请检查页面列表。`);
+        void showMessage(`${error.message}\n部分页面已上传，请检查页面列表。`);
       } else {
-        alert(error.message);
+        void showMessage(error.message);
       }
     }
   }, true);
@@ -245,7 +245,16 @@
     const hotspot = event.currentTarget;
     const interaction = interactionById(hotspot.dataset.id);
     if (!interaction || interaction.kind !== 'region' || savingRegionIds.has(interaction.id)) return;
-    if (selection?.interactionId !== interaction.id && !confirmDiscardSelection()) return;
+    if (selection?.interactionId !== interaction.id && hasUnsavedSelection()) {
+      event.preventDefault();
+      event.stopPropagation();
+      void confirmDiscardSelection().then((confirmed) => {
+        if (!confirmed) return;
+        clearSelection();
+        void selectInteraction(interaction.id, {source: 'canvas'});
+      });
+      return;
+    }
     if (selection?.interactionId !== interaction.id) {
       selection = null;
       renderSelection();
@@ -324,7 +333,7 @@
     const gesture = cleanupRegionDrag();
     if (!gesture) return;
     if (!gesture.moved) {
-      selectInteraction(gesture.interaction.id, {source: 'canvas'});
+      void selectInteraction(gesture.interaction.id, {source: 'canvas'});
       return;
     }
     void saveRegionPosition(gesture);
@@ -353,11 +362,11 @@
         renderInteractions();
         renderImageHotspots();
       } else {
-        selectInteraction(saved.id, {source: 'canvas'});
+        void selectInteraction(saved.id, {source: 'canvas'});
       }
     } catch (error) {
       restoreRegion(gesture);
-      alert(error.message);
+      void showMessage(error.message);
     } finally {
       savingRegionIds.delete(interaction.id);
     }
