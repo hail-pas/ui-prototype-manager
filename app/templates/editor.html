@@ -6,6 +6,7 @@
   <title>{{ project.name }} · UI Prototype Manager</title>
   <link rel="stylesheet" href="/static/app.css?v=20260831-external-link" />
   <link rel="stylesheet" href="/static/page-actions.css?v=20260903-page-copy-v3" />
+  <link rel="stylesheet" href="/static/media-pages.css?v=20260906-video-pages" />
 </head>
 <body class="editor-body">
   <div id="app" data-project-id="{{ project.id }}" class="editor-shell">
@@ -16,7 +17,7 @@
       </div>
       <div class="topbar-actions">
         <label class="storage-picker" title="选择本次上传的资源存储位置"><span>存储</span><select id="storageSelect"><option value="local">本地</option></select></label>
-        <label class="upload-btn">＋ 上传页面<input id="fileInput" type="file" multiple accept=".html,.htm,.zip,.png,.jpg,.jpeg,.webp,.gif" hidden /></label>
+        <label class="upload-btn">＋ 上传页面<input id="fileInput" type="file" multiple accept=".html,.htm,.zip,.png,.jpg,.jpeg,.webp,.gif,.mp4,.webm" hidden /></label>
         <a class="primary-btn" href="/project/{{ project.id }}/play" target="_blank">▶ 预览</a>
         <a class="ghost-btn" href="/logout">退出登录</a>
       </div>
@@ -29,7 +30,7 @@
         <button id="pageSearchClear" type="button" aria-label="清空页面搜索" title="清空" hidden>×</button>
       </div>
       <div id="pageList" class="page-list"></div>
-      <div class="sidebar-tip">先选中页面，再上下拖动调整顺序；搜索时暂停排序。HTML 与图片共用页面名称空间。</div>
+      <div class="sidebar-tip">先选中页面，再上下拖动调整顺序；搜索时暂停排序。HTML、图片与视频共用页面名称空间。</div>
     </aside>
 
     <main class="workspace">
@@ -60,7 +61,7 @@
         <div id="renderSettingsPanel" class="render-settings-panel"></div>
       </section>
       <div class="panel-heading">交互配置</div>
-      <div id="selectionPanel" class="selection-panel muted-panel">选择 HTML 元素或框选图片区域后，在这里命名，并设置页面跳转、外部网页或返回上一页。</div>
+      <div id="selectionPanel" class="selection-panel muted-panel">选择 HTML 元素或框选图片/视频区域后，在这里命名，并设置页面跳转、外部网页或返回上一页。</div>
       <div class="panel-heading interactions-heading">当前页交互 <span id="interactionCount" class="count-pill">0</span></div>
       <div id="interactionList" class="interaction-list"></div>
     </aside>
@@ -69,7 +70,7 @@
   <dialog id="uploadDialog" class="dialog upload-dialog">
     <form method="dialog" id="uploadForm">
       <h2 id="uploadDialogTitle">确认上传页面</h2>
-      <p class="dialog-note">ZIP 页面包需包含 index.html，可携带使用相对路径的图片、音视频、样式和脚本资源。</p>
+      <p class="dialog-note">支持 HTML、图片、MP4/WebM 视频页面；ZIP 页面包需包含 index.html，可携带使用相对路径的图片、音视频、样式和脚本资源。</p>
       <div id="uploadRows" class="upload-name-list"></div>
       <details class="render-config-details">
         <summary>HTML 显示配置（已有默认值，通常无需修改）</summary>
@@ -136,10 +137,12 @@
   </dialog>
 
   <input id="replaceImageInput" type="file" accept=".png,.jpg,.jpeg,.webp,.gif" hidden />
+  <input id="replaceVideoInput" type="file" accept=".mp4,.webm" hidden />
 
   <script src="/static/frame-fit.js?v=20260827-media-overlay"></script>
   <script src="/static/page-list.js?v=20260831-page-management"></script>
   <script src="/static/editor.js?v=20260831-external-link"></script>
   <script src="/static/page-actions.js?v=20260903-page-copy-v3"></script>
+  <script src="/static/editor-media.js?v=20260906-video-pages"></script>
 </body>
 </html>
