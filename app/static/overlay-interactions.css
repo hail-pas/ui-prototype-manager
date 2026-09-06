@@ -1,0 +1,33 @@
+/* Keep the visual stack explicit: page content < overlays < interactions < editor guides. */
+.hotspot {
+  z-index: 50;
+}
+
+/*
+ * Unselected overlays stay visually above the page but let region drawing reach
+ * the page stage. Their label remains a small direct-selection affordance; once
+ * selected (from the label or sidebar), the existing drag/resize behavior stays
+ * available.
+ */
+.editor-overlay:not(.is-selected) {
+  pointer-events: none;
+}
+
+.editor-overlay:not(.is-selected) .editor-overlay-label {
+  pointer-events: auto;
+  cursor: grab;
+}
+
+.editor-overlay.is-selected {
+  pointer-events: auto;
+}
+
+/* Player interactions always sit above both image and video overlays. */
+.player-overlay.is-image,
+.player-overlay.is-video {
+  z-index: 10;
+}
+
+.player-hotspot {
+  z-index: 20;
+}
