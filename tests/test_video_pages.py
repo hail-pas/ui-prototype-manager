@@ -206,18 +206,23 @@ class VideoPageTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("controls = false", script)
         self.assertIn("/api/interactions/${interaction.id}/region", editor_script)
 
-    def test_video_preview_uses_original_transition_lifecycle(self) -> None:
+    def test_preview_uses_one_transition_contract_for_all_page_types(self) -> None:
         player_script = (main.APP_DIR / "static" / "player.js").read_text()
         player_template = (main.APP_DIR / "templates" / "player.html").read_text()
 
         self.assertIn("requestVideoFrameCallback", player_script)
         self.assertIn("if (isVideo) await waitForPresentedVideoFrame(media, signal);", player_script)
         self.assertIn(".player-video-stage > video", player_script)
-        self.assertIn("if (item?.type === 'video')", player_script)
-        self.assertIn("status.hidden = false", player_script)
+        self.assertNotIn("if (item?.type === 'video') {\n    const status", player_script)
+        self.assertIn("transitionStatusTimer = window.setTimeout(() => {", player_script)
+        self.assertIn("}, PAGE_LOADING_DELAY_MS);", player_script)
         self.assertIn("outgoing.element.classList.add('is-leaving')", player_script)
+        self.assertIn(
+            "requestAnimationFrame(() => {\n    if (outgoing.destroyed || outgoing === activeView) return;\n    requestAnimationFrame(() => {",
+            player_script,
+        )
         self.assertIn("outgoing.element.classList.add('is-faded')", player_script)
-        self.assertIn("player.js?v=20260906-video-transition-v5", player_template)
+        self.assertIn("player.js?v=20260906-human-transition-v6", player_template)
         self.assertNotIn("player-media.js", player_template)
 
 
