@@ -2,7 +2,7 @@
   'use strict';
 
   function waitForPresentedVideoFrame(video, signal) {
-    if (typeof video.requestVideoFrameCallback !== 'function') {
+    if (!activeView || typeof video.requestVideoFrameCallback !== 'function') {
       return afterStablePaint(signal);
     }
     return abortable(new Promise((resolve) => {
