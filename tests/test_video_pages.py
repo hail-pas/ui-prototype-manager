@@ -124,9 +124,17 @@ class VideoPageTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
 
-    async def test_replace_copy_and_move_region_keep_video_page_semantics(self) -> None:
+    async def test_video_page_keeps_overlays_replace_copy_and_region_moves(self) -> None:
         page = await self.create_video_page()
         page_id = page["id"]
+        overlay = await page_management.api_create_overlay_with_video_page(
+            page_id,
+            upload("overlay.mp4", mp4_bytes(640, 360), "video/mp4"),
+            "local",
+        )
+        self.assertEqual(overlay["page_id"], page_id)
+        self.assertEqual(overlay["type"], "video")
+
         created_at = main.now_iso()
         with main.db() as connection:
             connection.execute(
@@ -173,6 +181,13 @@ class VideoPageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 connection.execute(
                     "SELECT COUNT(*) AS n FROM interactions WHERE source_page_id = ?",
+                    (copied["page"]["id"],),
+                ).fetchone()["n"],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) AS n FROM overlays WHERE page_id = ?",
                     (copied["page"]["id"],),
                 ).fetchone()["n"],
                 1,
