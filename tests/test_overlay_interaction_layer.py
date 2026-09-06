@@ -23,7 +23,7 @@ def test_editor_overlay_allows_drawing_without_losing_selection_controls() -> No
 
 def test_html_element_interactions_are_mirrored_above_outer_overlays() -> None:
     assert ".html-interaction-layer {" in CSS
-    assert "z-index: 50;" in CSS
+    assert "z-index: 50;\n  overflow: visible;" in CSS
     assert ".html-interaction-marker.is-active {\n  z-index: 3;" in CSS
     assert "frame.contentDocument" in HTML_LAYER_JS
     assert "target.getBoundingClientRect()" in HTML_LAYER_JS
