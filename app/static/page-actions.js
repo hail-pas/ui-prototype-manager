@@ -19,6 +19,10 @@
     return String(value || '').trim().replace(/\s+/g, ' ');
   }
 
+  function showMessage(message) {
+    return window.UIPMDialog.alert(message);
+  }
+
   async function requestJson(url, options = {}) {
     const response = await fetch(url, options);
     if (response.status === 401) {
@@ -59,12 +63,12 @@
 
       const name = cleanName(renameInput.value);
       if (!name) {
-        alert('请输入名称');
+        await showMessage('请输入名称');
         renameInput.focus();
         return;
       }
       if (name.length > 120) {
-        alert('名称不能超过 120 个字符');
+        await showMessage('名称不能超过 120 个字符');
         renameInput.focus();
         return;
       }
@@ -75,7 +79,7 @@
         await pageActionDialog.submit(name);
         renameDialog.close();
       } catch (error) {
-        alert(error.message);
+        await showMessage(error.message);
       } finally {
         if (submitButton) submitButton.disabled = false;
       }
@@ -180,7 +184,7 @@
         location.reload();
       } catch (error) {
         button.disabled = false;
-        alert(error.message);
+        await showMessage(error.message);
       }
     }, true);
   }
@@ -233,7 +237,8 @@
   }
 
   function installCopyButton(row) {
-    if (pageType(row) !== 'IMG' || row.querySelector('.copy-page')) return;
+    const type = pageType(row);
+    if (!['IMG', 'VID'].includes(type) || row.querySelector('.copy-page')) return;
 
     const pageId = row.dataset.id;
     const rename = row.querySelector('.rename-page');
@@ -250,11 +255,12 @@
     button.addEventListener('click', (event) => {
       event.stopPropagation();
       const originalName = cleanName(pageNameNode.textContent);
+      const pageKind = pageType(row) === 'VID' ? '视频' : '图片';
       openNameDialog({
         mode: 'page-copy',
         title: '复制页面',
         value: `${originalName} copy`,
-        note: '将复制图片页面及其交互和页面元素配置，复制后与原页面相互独立。',
+        note: `将复制${pageKind}页面及其交互和页面元素配置，复制后与原页面相互独立。`,
         submit: async (name) => {
           button.disabled = true;
           button.classList.add('is-busy');
