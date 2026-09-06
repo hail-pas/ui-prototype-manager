@@ -1,4 +1,8 @@
 /* Keep the visual stack explicit: page content < overlays < interactions < editor guides. */
+.overlay-layer {
+  z-index: 10;
+}
+
 .hotspot {
   z-index: 50;
 }
@@ -20,6 +24,56 @@
 
 .editor-overlay.is-selected {
   pointer-events: auto;
+}
+
+/* HTML element markers are mirrored outside the iframe so overlays cannot cover them. */
+.html-interaction-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  overflow: hidden;
+  line-height: normal;
+  pointer-events: none;
+}
+
+.html-interaction-marker {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px solid rgba(37,99,235,.72);
+  border-radius: 4px;
+  background: rgba(37,99,235,.08);
+  pointer-events: none;
+}
+
+.html-interaction-marker.is-hovered {
+  border-color: #2563eb;
+  background: rgba(37,99,235,.14);
+}
+
+.html-interaction-marker.is-active {
+  border: 3px solid #2563eb;
+  background: rgba(37,99,235,.16);
+  box-shadow: 0 0 0 3px rgba(37,99,235,.18);
+}
+
+.html-interaction-marker.is-draft {
+  border-style: dashed;
+}
+
+.html-interaction-marker > span {
+  position: absolute;
+  top: -22px;
+  left: -1px;
+  max-width: 240px;
+  overflow: hidden;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: #2563eb;
+  color: #fff;
+  font: 600 11px/1.35 Inter,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(29,78,216,.24);
 }
 
 /* Player interactions always sit above both image and video overlays. */
