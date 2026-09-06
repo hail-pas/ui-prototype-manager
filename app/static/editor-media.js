@@ -334,7 +334,11 @@
 
   function finishRegionDrag() {
     const gesture = cleanupRegionDrag();
-    if (!gesture || !gesture.moved) return;
+    if (!gesture) return;
+    if (!gesture.moved) {
+      selectInteraction(gesture.interaction.id, {source: 'canvas'});
+      return;
+    }
     void saveRegionPosition(gesture);
   }
 
@@ -355,10 +359,14 @@
       });
       const index = state.interactions.findIndex((item) => item.id === saved.id);
       if (index >= 0) state.interactions[index] = saved;
-      if (selection?.interactionId === saved.id) selection.payload = {...saved.payload};
-      renderSelection();
-      renderInteractions();
-      renderImageHotspots();
+      if (selection?.interactionId === saved.id) {
+        selection.payload = {...saved.payload};
+        renderSelection();
+        renderInteractions();
+        renderImageHotspots();
+      } else {
+        selectInteraction(saved.id, {source: 'canvas'});
+      }
     } catch (error) {
       restoreRegion(gesture);
       alert(error.message);
