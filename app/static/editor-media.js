@@ -167,10 +167,15 @@
       return alert('设计高度需在 240–10000 之间');
     }
 
-    const regular = [];
-    const videos = [];
+    const groups = [];
     pendingFiles.forEach((file, index) => {
-      (isVideoFile(file) ? videos : regular).push({file, name: names[index]});
+      const kind = isVideoFile(file) ? 'video' : 'regular';
+      let group = groups[groups.length - 1];
+      if (!group || group.kind !== kind) {
+        group = {kind, items: []};
+        groups.push(group);
+      }
+      group.items.push({file, name: names[index]});
     });
 
     const storageBackend = storageSelect.value || 'local';
@@ -191,18 +196,17 @@
     let completedGroup = false;
     setUploadInProgress(true, fileCount);
     try {
-      if (regular.length) {
-        await api(`/api/projects/${projectId}/pages`, {
-          method: 'POST',
-          body: makeForm(regular, true),
-        });
-        completedGroup = true;
-      }
-      if (videos.length) {
-        await api(`/api/projects/${projectId}/video-pages`, {
-          method: 'POST',
-          body: makeForm(videos, false),
-        });
+      for (const group of groups) {
+        const videoGroup = group.kind === 'video';
+        await api(
+          videoGroup
+            ? `/api/projects/${projectId}/video-pages`
+            : `/api/projects/${projectId}/pages`,
+          {
+            method: 'POST',
+            body: makeForm(group.items, !videoGroup),
+          },
+        );
         completedGroup = true;
       }
       uploadDialogTitle.textContent = '上传完成';
