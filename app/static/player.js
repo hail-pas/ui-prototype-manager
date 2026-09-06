@@ -676,10 +676,13 @@ function commitPageView(view) {
   outgoing.element.classList.add('is-leaving');
   requestAnimationFrame(() => {
     if (outgoing.destroyed || outgoing === activeView) return;
-    outgoing.element.classList.add('is-faded');
-    window.setTimeout(() => {
-      if (outgoing !== activeView) storeCachedView(outgoing);
-    }, PAGE_TRANSITION_MS);
+    requestAnimationFrame(() => {
+      if (outgoing.destroyed || outgoing === activeView) return;
+      outgoing.element.classList.add('is-faded');
+      window.setTimeout(() => {
+        if (outgoing !== activeView) storeCachedView(outgoing);
+      }, PAGE_TRANSITION_MS);
+    });
   });
 }
 
@@ -712,14 +715,8 @@ function clearTransitionStatus() {
 function beginTransitionStatus(request) {
   clearTransitionStatus();
   stage.setAttribute('aria-busy', 'true');
-  const item = page(request.pageId);
-  if (item?.type === 'video') {
-    const status = ensureTransitionStatus();
-    status.textContent = `正在打开“${item.name || '目标页面'}”…`;
-    status.hidden = false;
-    return;
-  }
   transitionStatusTimer = window.setTimeout(() => {
+    const item = page(request.pageId);
     const status = ensureTransitionStatus();
     status.textContent = `正在打开“${item?.name || '目标页面'}”…`;
     status.hidden = false;
