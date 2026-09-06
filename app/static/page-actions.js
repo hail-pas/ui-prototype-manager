@@ -251,7 +251,7 @@
     button.addEventListener('click', (event) => {
       event.stopPropagation();
       const originalName = cleanName(pageNameNode.textContent);
-      const pageKind = type === 'VID' ? '视频' : '图片';
+      const pageKind = pageType(row) === 'VID' ? '视频' : '图片';
       openNameDialog({
         mode: 'page-copy',
         title: '复制页面',
