@@ -10,6 +10,21 @@
     }), signal);
   }
 
+  const beginBaseTransitionStatus = beginTransitionStatus;
+  beginTransitionStatus = function beginMediaTransitionStatus(request) {
+    const target = page(request.pageId);
+    if (target?.type !== 'video') {
+      beginBaseTransitionStatus(request);
+      return;
+    }
+
+    clearTransitionStatus();
+    stage.setAttribute('aria-busy', 'true');
+    const status = ensureTransitionStatus();
+    status.textContent = `正在打开“${target.name || '目标页面'}”…`;
+    status.hidden = false;
+  };
+
   const takeBaseCachedView = takeCachedView;
   takeCachedView = async function takeCachedMediaView(pageId, signal) {
     const view = await takeBaseCachedView(pageId, signal);
