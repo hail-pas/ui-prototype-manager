@@ -1,4 +1,6 @@
 .image-stage>video{display:block;max-width:100%;height:auto;pointer-events:none}
 .player-video-stage>video{display:block;width:100%;height:auto;pointer-events:none}
+.player-page-view.is-leaving{transition:none}
+.player-page-view.is-leaving.is-faded{opacity:1}
 .hotspot[data-id]{touch-action:none;cursor:move}
 .hotspot[data-id].is-dragging{cursor:grabbing}
