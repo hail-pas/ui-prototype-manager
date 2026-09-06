@@ -8,9 +8,14 @@ EDITOR_TEMPLATE = (ROOT / "app/templates/editor.html").read_text(encoding="utf-8
 PLAYER_TEMPLATE = (ROOT / "app/templates/player.html").read_text(encoding="utf-8")
 
 
-def test_editor_overlay_sits_below_region_interactions_and_allows_drawing() -> None:
+def test_editor_overlay_sits_below_every_region_interaction_state() -> None:
     assert ".overlay-layer {\n  z-index: 10;" in CSS
     assert ".hotspot {\n  z-index: 50;" in CSS
+    assert ".hotspot:hover,\n.hotspot.is-hovered {\n  z-index: 55;" in CSS
+    assert ".hotspot.is-active,\n.hotspot.draft.is-active {\n  z-index: 60;" in CSS
+
+
+def test_editor_overlay_allows_drawing_without_losing_selection_controls() -> None:
     assert ".editor-overlay:not(.is-selected) {\n  pointer-events: none;" in CSS
     assert ".editor-overlay:not(.is-selected) .editor-overlay-label {\n  pointer-events: auto;" in CSS
     assert ".editor-overlay.is-selected {\n  pointer-events: auto;" in CSS
@@ -19,6 +24,7 @@ def test_editor_overlay_sits_below_region_interactions_and_allows_drawing() -> N
 def test_html_element_interactions_are_mirrored_above_outer_overlays() -> None:
     assert ".html-interaction-layer {" in CSS
     assert "z-index: 50;" in CSS
+    assert ".html-interaction-marker.is-active {\n  z-index: 3;" in CSS
     assert "frame.contentDocument" in HTML_LAYER_JS
     assert "target.getBoundingClientRect()" in HTML_LAYER_JS
     assert "selection?.isNew && selection.kind === 'element'" in HTML_LAYER_JS
