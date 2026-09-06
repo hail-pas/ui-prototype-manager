@@ -233,7 +233,8 @@
   }
 
   function installCopyButton(row) {
-    if (pageType(row) !== 'IMG' || row.querySelector('.copy-page')) return;
+    const type = pageType(row);
+    if (!['IMG', 'VID'].includes(type) || row.querySelector('.copy-page')) return;
 
     const pageId = row.dataset.id;
     const rename = row.querySelector('.rename-page');
@@ -250,11 +251,12 @@
     button.addEventListener('click', (event) => {
       event.stopPropagation();
       const originalName = cleanName(pageNameNode.textContent);
+      const pageKind = type === 'VID' ? '视频' : '图片';
       openNameDialog({
         mode: 'page-copy',
         title: '复制页面',
         value: `${originalName} copy`,
-        note: '将复制图片页面及其交互和页面元素配置，复制后与原页面相互独立。',
+        note: `将复制${pageKind}页面及其交互和页面元素配置，复制后与原页面相互独立。`,
         submit: async (name) => {
           button.disabled = true;
           button.classList.add('is-busy');
