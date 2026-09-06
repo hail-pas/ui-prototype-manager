@@ -195,31 +195,30 @@ class VideoPageTests(unittest.IsolatedAsyncioTestCase):
 
     def test_frontend_video_is_background_media_without_controls(self) -> None:
         editor_script = (main.APP_DIR / "static" / "editor-media.js").read_text()
-        player_script = (main.APP_DIR / "static" / "player-media.js").read_text()
+        player_script = (main.APP_DIR / "static" / "player.js").read_text()
         editor_template = (main.APP_DIR / "templates" / "editor.html").read_text()
 
         self.assertIn('.mp4,.webm', editor_template)
         for script in (editor_script, player_script):
-            self.assertIn("video.autoplay = true", script)
-            self.assertIn("video.loop = true", script)
-            self.assertIn("video.muted = true", script)
-            self.assertIn("video.controls = false", script)
+            self.assertIn("autoplay = true", script)
+            self.assertIn("loop = true", script)
+            self.assertIn("muted = true", script)
+            self.assertIn("controls = false", script)
         self.assertIn("/api/interactions/${interaction.id}/region", editor_script)
 
-    def test_video_preview_waits_for_a_presented_frame_and_shows_feedback(self) -> None:
-        player_script = (main.APP_DIR / "static" / "player-media.js").read_text()
+    def test_video_preview_uses_original_transition_lifecycle(self) -> None:
+        player_script = (main.APP_DIR / "static" / "player.js").read_text()
         player_template = (main.APP_DIR / "templates" / "player.html").read_text()
 
         self.assertIn("requestVideoFrameCallback", player_script)
-        self.assertIn("await waitForPresentedVideoFrame(video, signal)", player_script)
-        self.assertIn("beginMediaTransitionStatus", player_script)
+        self.assertIn("if (isVideo) await waitForPresentedVideoFrame(media, signal);", player_script)
+        self.assertIn(".player-video-stage > video", player_script)
+        self.assertIn("if (item?.type === 'video')", player_script)
         self.assertIn("status.hidden = false", player_script)
-        self.assertIn(
-            "if (item.type !== 'video') return createBaseImagePageView(item, signal);",
-            player_script,
-        )
-        self.assertIn("player-media.js?v=20260906-video-transition-v4", player_template)
-        self.assertNotIn("player-media.js?v=20260906-video-pages", player_template)
+        self.assertIn("outgoing.element.classList.add('is-leaving')", player_script)
+        self.assertIn("outgoing.element.classList.add('is-faded')", player_script)
+        self.assertIn("player.js?v=20260906-video-transition-v5", player_template)
+        self.assertNotIn("player-media.js", player_template)
 
 
 if __name__ == "__main__":
