@@ -1,6 +1,15 @@
 (() => {
   'use strict';
 
+  function waitForPresentedVideoFrame(video, signal) {
+    if (typeof video.requestVideoFrameCallback !== 'function') {
+      return afterStablePaint(signal);
+    }
+    return abortable(new Promise((resolve) => {
+      video.requestVideoFrameCallback(() => resolve());
+    }), signal);
+  }
+
   const createBaseImagePageView = createImagePageView;
   createImagePageView = function createMediaPageView(item, signal) {
     if (item.type !== 'video') return createBaseImagePageView(item, signal);
@@ -35,6 +44,7 @@
         await abortable(refreshPageContentUrl(item), signal);
         await load();
       }
+      await waitForPresentedVideoFrame(video, signal);
     };
     const view = {
       controller: null,
