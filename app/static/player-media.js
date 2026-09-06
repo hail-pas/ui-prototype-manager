@@ -10,6 +10,14 @@
     }), signal);
   }
 
+  const takeBaseCachedView = takeCachedView;
+  takeCachedView = async function takeCachedMediaView(pageId, signal) {
+    const view = await takeBaseCachedView(pageId, signal);
+    const video = view?.element.querySelector('.player-video-stage > video');
+    if (video) await waitForPresentedVideoFrame(video, signal);
+    return view;
+  };
+
   const createBaseImagePageView = createImagePageView;
   createImagePageView = function createMediaPageView(item, signal) {
     if (item.type !== 'video') return createBaseImagePageView(item, signal);
