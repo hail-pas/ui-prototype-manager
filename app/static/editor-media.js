@@ -100,22 +100,6 @@
         storage.textContent = storage.textContent.replace(/\s·\sIMG$/, ' · VID');
       }
 
-      const copyButton = row.querySelector('.copy-page');
-      if (copyButton && copyButton.dataset.videoPage !== '1') {
-        copyButton.dataset.videoPage = '1';
-        copyButton.title = '复制视频页面（深拷贝）';
-        copyButton.setAttribute('aria-label', `复制 ${page.name}`);
-        copyButton.addEventListener('click', () => {
-          queueMicrotask(() => {
-            const dialog = document.getElementById('renameDialog');
-            const note = dialog?.querySelector('.dialog-note');
-            if (dialog?.dataset.pageActionMode === 'page-copy' && note) {
-              note.textContent = '将复制视频页面及其交互和页面元素配置，复制后与原页面相互独立。';
-            }
-          });
-        }, true);
-      }
-
       if (row.querySelector('.replace-page-video')) return;
       const rename = row.querySelector('.rename-page');
       if (!rename || !replaceVideoInput) return;
