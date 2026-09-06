@@ -335,6 +335,15 @@ async function loadVideoMedia(video, url, signal) {
   if (playback) playback.catch(() => {});
 }
 
+function waitForPresentedVideoFrame(video, signal) {
+  if (!activeView || typeof video.requestVideoFrameCallback !== 'function') {
+    return afterStablePaint(signal);
+  }
+  return abortable(new Promise((resolve) => {
+    video.requestVideoFrameCallback(() => resolve());
+  }), signal);
+}
+
 function createPlayerOverlay(item, signal) {
   const media = document.createElement(item.type === 'video' ? 'video' : 'img');
   media.className = `player-overlay is-${item.type}`;
@@ -388,7 +397,9 @@ function createPlayerOverlayLayer(pageId, signal) {
 
 function createPageLayer(item) {
   const element = document.createElement('div');
-  element.className = `player-page-view is-preparing ${item.type === 'image' ? 'is-image-view' : 'is-html-view'}`;
+  const viewClass = item.type === 'html' ? 'is-html-view' : 'is-image-view';
+  const videoClass = item.type === 'video' ? ' is-video-view' : '';
+  element.className = `player-page-view is-preparing ${viewClass}${videoClass}`;
   element.dataset.pageId = item.id;
   element.inert = true;
   element.setAttribute('aria-hidden', 'true');
@@ -489,27 +500,42 @@ function handleImageBlankClick(event, pageId) {
 }
 
 function createImagePageView(item, signal) {
+  const isVideo = item.type === 'video';
   const element = createPageLayer(item);
-  const imageStage = document.createElement('div');
-  imageStage.className = 'player-image-stage';
-  const image = document.createElement('img');
-  image.alt = item.name;
-  image.decoding = 'async';
-  imageStage.appendChild(image);
+  const mediaStage = document.createElement('div');
+  mediaStage.className = `player-image-stage${isVideo ? ' player-video-stage' : ''}`;
+  const media = document.createElement(isVideo ? 'video' : 'img');
+  if (isVideo) {
+    media.autoplay = true;
+    media.loop = true;
+    media.muted = true;
+    media.defaultMuted = true;
+    media.controls = false;
+    media.playsInline = true;
+    media.preload = 'auto';
+  } else {
+    media.alt = item.name;
+    media.decoding = 'async';
+  }
+  mediaStage.appendChild(media);
   const overlay = createPlayerOverlayLayer(item.id, signal);
-  imageStage.appendChild(overlay.layer);
-  appendImageHotspots(imageStage, item.id);
-  imageStage.addEventListener('click', (event) => handleImageBlankClick(event, item.id));
-  element.appendChild(imageStage);
+  mediaStage.appendChild(overlay.layer);
+  appendImageHotspots(mediaStage, item.id);
+  mediaStage.addEventListener('click', (event) => handleImageBlankClick(event, item.id));
+  element.appendChild(mediaStage);
 
-  const loadBaseImage = async () => {
+  const loadBaseMedia = async () => {
+    const load = () => isVideo
+      ? loadVideoMedia(media, pageContentUrl(item), signal)
+      : loadImageMedia(media, pageContentUrl(item), signal);
     try {
-      await loadImageMedia(image, pageContentUrl(item), signal);
+      await load();
     } catch (error) {
       if (signal.aborted) throw error;
       await abortable(refreshPageContentUrl(item), signal);
-      await loadImageMedia(image, pageContentUrl(item), signal);
+      await load();
     }
+    if (isVideo) await waitForPresentedVideoFrame(media, signal);
   };
   const view = {
     controller: null,
@@ -517,7 +543,7 @@ function createImagePageView(item, signal) {
     element,
     markContentReady: null,
     pageId: item.id,
-    ready: Promise.all([loadBaseImage(), overlay.ready]),
+    ready: Promise.all([loadBaseMedia(), overlay.ready]),
     returnToCacheOnDiscard: false,
   };
   pageViews.add(view);
@@ -578,6 +604,8 @@ async function takeCachedView(pageId, signal) {
   view.controller?.relayout();
   resumeViewMedia(view);
   try {
+    const video = view.element.querySelector('.player-video-stage > video');
+    if (video) await waitForPresentedVideoFrame(video, signal);
     await afterStablePaint(signal);
     return view;
   } catch (error) {
@@ -593,7 +621,9 @@ async function preparePageView(pageId, signal) {
   if (cached) return cached;
 
   throwIfAborted(signal);
-  if (contentUrlExpiring(item)) await abortable(refreshPageContentUrl(item), signal);
+  if ((item.type === 'video' && !item.content_url) || contentUrlExpiring(item)) {
+    await abortable(refreshPageContentUrl(item), signal);
+  }
   throwIfAborted(signal);
   const viewAbortController = new AbortController();
   const relayAbort = () => viewAbortController.abort();
@@ -682,8 +712,14 @@ function clearTransitionStatus() {
 function beginTransitionStatus(request) {
   clearTransitionStatus();
   stage.setAttribute('aria-busy', 'true');
+  const item = page(request.pageId);
+  if (item?.type === 'video') {
+    const status = ensureTransitionStatus();
+    status.textContent = `正在打开“${item.name || '目标页面'}”…`;
+    status.hidden = false;
+    return;
+  }
   transitionStatusTimer = window.setTimeout(() => {
-    const item = page(request.pageId);
     const status = ensureTransitionStatus();
     status.textContent = `正在打开“${item?.name || '目标页面'}”…`;
     status.hidden = false;
@@ -739,7 +775,7 @@ function renderPageList(pendingPageId = null) {
   }
   pageList.innerHTML = visiblePages.map((item) => `
     <button type="button" class="player-page-item ${item.id === currentPageId ? 'active' : ''} ${item.id === pendingPageId ? 'pending' : ''}" data-id="${item.id}">
-      <span class="player-page-type">${item.type === 'html' ? 'HTML' : 'IMG'}</span>
+      <span class="player-page-type">${item.type === 'html' ? 'HTML' : item.type === 'video' ? 'VID' : 'IMG'}</span>
       <span class="player-page-name">${esc(item.name)}</span>
     </button>`).join('');
   pageList.querySelectorAll('.player-page-item').forEach((button) => {
