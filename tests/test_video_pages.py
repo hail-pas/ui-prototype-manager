@@ -206,6 +206,16 @@ class VideoPageTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("video.controls = false", script)
         self.assertIn("/api/interactions/${interaction.id}/region", editor_script)
 
+    def test_video_preview_waits_for_a_presented_frame_before_commit(self) -> None:
+        player_script = (main.APP_DIR / "static" / "player-media.js").read_text()
+
+        self.assertIn("requestVideoFrameCallback", player_script)
+        self.assertIn("await waitForPresentedVideoFrame(video, signal)", player_script)
+        self.assertIn(
+            "if (item.type !== 'video') return createBaseImagePageView(item, signal);",
+            player_script,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
