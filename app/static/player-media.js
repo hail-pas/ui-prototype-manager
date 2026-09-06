@@ -36,6 +36,9 @@
     element.appendChild(mediaStage);
 
     const loadBaseVideo = async () => {
+      if (!item.content_url) {
+        await abortable(refreshPageContentUrl(item), signal);
+      }
       const load = () => loadVideoMedia(video, pageContentUrl(item), signal);
       try {
         await load();
