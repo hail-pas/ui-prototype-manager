@@ -80,6 +80,8 @@ let uploadInProgress = false;
 let draggedPageId = null;
 let pageOrderSaving = false;
 let replaceImagePageId = null;
+let confirmDialogResolve = null;
+let messageDialogResolve = null;
 
 function esc(value = '') {
   const element = document.createElement('div');
@@ -162,9 +164,141 @@ function selectionForInteraction(interaction, label = '') {
   };
 }
 
-function confirmDiscardSelection() {
-  if (!selection || (!selection.isNew && !selection.dirty)) return true;
-  return window.confirm('当前交互配置尚未保存，是否放弃修改？');
+function ensureMessageDialog() {
+  let dialog = document.getElementById('messageDialog');
+  if (dialog) return dialog;
+  dialog = document.createElement('dialog');
+  dialog.id = 'messageDialog';
+  dialog.className = 'dialog compact-dialog';
+  dialog.innerHTML = `
+    <form method="dialog">
+      <h2>提示</h2>
+      <p class="message-dialog-text"></p>
+      <div class="dialog-actions">
+        <button type="button" class="primary-btn message-dialog-ok">确定</button>
+      </div>
+    </form>`;
+  document.body.appendChild(dialog);
+  return dialog;
+}
+
+function showMessage(message, {title = '提示', buttonText = '确定'} = {}) {
+  const dialog = ensureMessageDialog();
+  const titleNode = dialog.querySelector('h2');
+  const textNode = dialog.querySelector('.message-dialog-text');
+  const ok = dialog.querySelector('.message-dialog-ok');
+
+  if (messageDialogResolve) {
+    const resolve = messageDialogResolve;
+    messageDialogResolve = null;
+    resolve();
+  }
+  if (dialog.open) dialog.close();
+  titleNode.textContent = title;
+  textNode.textContent = String(message || '');
+  ok.textContent = buttonText;
+
+  return new Promise((resolve) => {
+    messageDialogResolve = resolve;
+    const settle = () => {
+      if (!messageDialogResolve) return;
+      const currentResolve = messageDialogResolve;
+      messageDialogResolve = null;
+      ok.onclick = null;
+      dialog.oncancel = null;
+      dialog.onclose = null;
+      if (dialog.open) dialog.close();
+      currentResolve();
+    };
+    ok.onclick = settle;
+    dialog.oncancel = (event) => {
+      event.preventDefault();
+      settle();
+    };
+    dialog.onclose = () => {
+      if (!messageDialogResolve) return;
+      const currentResolve = messageDialogResolve;
+      messageDialogResolve = null;
+      ok.onclick = null;
+      dialog.oncancel = null;
+      dialog.onclose = null;
+      currentResolve();
+    };
+    dialog.showModal();
+    requestAnimationFrame(() => ok.focus());
+  });
+}
+
+function showConfirm(message, {
+  title = '确认操作',
+  confirmText = '确定',
+  cancelText = '取消',
+  danger = false,
+} = {}) {
+  const titleNode = confirmDialog.querySelector('h2');
+  const textNode = document.getElementById('confirmText');
+  const ok = document.getElementById('confirmOk');
+  const cancel = document.getElementById('confirmCancel');
+
+  if (confirmDialogResolve) {
+    const resolve = confirmDialogResolve;
+    confirmDialogResolve = null;
+    resolve(false);
+  }
+  if (confirmDialog.open) confirmDialog.close();
+  titleNode.textContent = title;
+  textNode.textContent = String(message || '');
+  ok.textContent = confirmText;
+  cancel.textContent = cancelText;
+  ok.className = danger ? 'danger-btn' : 'primary-btn';
+
+  return new Promise((resolve) => {
+    confirmDialogResolve = resolve;
+    const settle = (result) => {
+      if (!confirmDialogResolve) return;
+      const currentResolve = confirmDialogResolve;
+      confirmDialogResolve = null;
+      ok.onclick = null;
+      cancel.onclick = null;
+      confirmDialog.oncancel = null;
+      confirmDialog.onclose = null;
+      if (confirmDialog.open) confirmDialog.close();
+      currentResolve(result);
+    };
+    ok.onclick = () => settle(true);
+    cancel.onclick = () => settle(false);
+    confirmDialog.oncancel = (event) => {
+      event.preventDefault();
+      settle(false);
+    };
+    confirmDialog.onclose = () => {
+      if (!confirmDialogResolve) return;
+      const currentResolve = confirmDialogResolve;
+      confirmDialogResolve = null;
+      ok.onclick = null;
+      cancel.onclick = null;
+      confirmDialog.oncancel = null;
+      confirmDialog.onclose = null;
+      currentResolve(false);
+    };
+    confirmDialog.showModal();
+    requestAnimationFrame(() => cancel.focus());
+  });
+}
+
+window.UIPMDialog = Object.freeze({alert: showMessage, confirm: showConfirm});
+
+function hasUnsavedSelection() {
+  return Boolean(selection && (selection.isNew || selection.dirty));
+}
+
+async function confirmDiscardSelection() {
+  if (!hasUnsavedSelection()) return true;
+  return showConfirm('当前交互配置尚未保存，是否放弃修改？', {
+    title: '放弃未保存修改',
+    confirmText: '放弃修改',
+    danger: true,
+  });
 }
 
 function uploadElapsedSeconds() {
@@ -308,9 +442,9 @@ function renderPageList() {
     </div>`).join('');
 
   pageList.querySelectorAll('.page-item').forEach((row) => {
-    row.addEventListener('click', (event) => {
+    row.addEventListener('click', async (event) => {
       if (event.target.closest('button') || row.dataset.id === currentPageId) return;
-      if (!confirmDiscardSelection()) return;
+      if (!await confirmDiscardSelection()) return;
       currentPageId = row.dataset.id;
       selection = null;
       selectedOverlayId = null;
@@ -320,21 +454,21 @@ function renderPageList() {
       htmlElementMeta = new Map();
       renderAll();
     });
-    row.querySelector('.replace-page-image')?.addEventListener('click', (event) => {
+    row.querySelector('.replace-page-image')?.addEventListener('click', async (event) => {
       event.stopPropagation();
-      if (!confirmDiscardSelection()) return;
+      if (!await confirmDiscardSelection()) return;
       replaceImagePageId = row.dataset.id;
       replaceImageInput.value = '';
       replaceImageInput.click();
     });
-    row.querySelector('.rename-page').addEventListener('click', (event) => {
+    row.querySelector('.rename-page').addEventListener('click', async (event) => {
       event.stopPropagation();
-      if (!confirmDiscardSelection()) return;
+      if (!await confirmDiscardSelection()) return;
       openRename('page', row.dataset.id);
     });
     row.querySelector('.delete-page').addEventListener('click', (event) => {
       event.stopPropagation();
-      askDeletePage(row.dataset.id);
+      void askDeletePage(row.dataset.id);
     });
     row.addEventListener('dragstart', (event) => {
       if (searching || pageOrderSaving || row.dataset.id !== currentPageId) {
@@ -388,7 +522,7 @@ async function persistPageOrder(nextPages) {
     state.pages.forEach((page, index) => { page.sort_order = index; });
   } catch (error) {
     state.pages = previousPages;
-    alert(error.message);
+    void showMessage(error.message);
   } finally {
     pageOrderSaving = false;
     renderPageList();
@@ -412,7 +546,7 @@ async function renderCanvas() {
         <p>HTML：点击元素配置跳转；图片：拖拽框选区域配置跳转。</p>
         <label class="primary-btn">上传页面<input class="emptyUpload" type="file" multiple accept=".html,.htm,.zip,.png,.jpg,.jpeg,.webp,.gif" hidden></label>
       </div>`;
-    canvasArea.querySelector('.emptyUpload').addEventListener('change', (event) => prepareUpload(event.target.files));
+    canvasArea.querySelector('.emptyUpload').addEventListener('change', (event) => void prepareUpload(event.target.files));
     return;
   }
 
@@ -470,7 +604,7 @@ async function renderCanvas() {
       await refreshPageContentUrl(page);
       if (page.id === currentPageId) image.src = pageContentUrl(page);
     } catch (error) {
-      alert(error.message);
+      void showMessage(error.message);
     }
   });
   if (image.complete && image.naturalWidth > 0) initImageStage();
@@ -508,7 +642,7 @@ async function retryOverlayMedia(media, overlay) {
     await refreshOverlayContentUrl(overlay);
     if (overlay.page_id === currentPageId && media.isConnected) media.src = overlayContentUrl(overlay);
   } catch (error) {
-    alert(error.message);
+    void showMessage(error.message);
   }
 }
 
@@ -561,7 +695,7 @@ function createEditorOverlayElement(overlay) {
   element.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
-      selectOverlay(overlay.id, {source: 'canvas'});
+      void selectOverlay(overlay.id, {source: 'canvas'});
     }
   });
   return element;
@@ -640,14 +774,13 @@ function scrollEditorOverlayIntoView(overlayId) {
   });
 }
 
-function selectOverlay(overlayId, {source = 'canvas'} = {}) {
+function applyOverlaySelection(overlayId, {source = 'canvas'} = {}) {
   const overlay = overlayById(overlayId);
   if (!overlay || overlay.page_id !== currentPageId) return false;
   if (selectedOverlayId === overlayId) {
     if (source === 'list') scrollEditorOverlayIntoView(overlayId);
     return true;
   }
-  if (!confirmDiscardSelection()) return false;
   selection = null;
   hoveredInteractionId = null;
   selectedOverlayId = overlayId;
@@ -659,6 +792,17 @@ function selectOverlay(overlayId, {source = 'canvas'} = {}) {
   if (source === 'list') scrollEditorOverlayIntoView(overlayId);
   else scrollOverlayListItemIntoView(overlayId);
   return true;
+}
+
+async function selectOverlay(overlayId, {source = 'canvas'} = {}) {
+  const overlay = overlayById(overlayId);
+  if (!overlay || overlay.page_id !== currentPageId) return false;
+  if (selectedOverlayId === overlayId) {
+    if (source === 'list') scrollEditorOverlayIntoView(overlayId);
+    return true;
+  }
+  if (!await confirmDiscardSelection()) return false;
+  return applyOverlaySelection(overlayId, {source});
 }
 
 function clearOverlaySelection() {
@@ -713,7 +857,18 @@ function startOverlayGesture(event, overlayId, mode) {
   if (event.button !== 0 || overlayGesture || savingOverlayIds.has(overlayId)) return;
   if (mode === 'resize') event.stopPropagation();
   const overlay = overlayById(overlayId);
-  if (!overlay || !selectOverlay(overlayId)) return;
+  if (!overlay) return;
+  if (hasUnsavedSelection()) {
+    event.preventDefault();
+    event.stopPropagation();
+    void confirmDiscardSelection().then((confirmed) => {
+      if (!confirmed) return;
+      clearSelection();
+      applyOverlaySelection(overlayId, {source: 'canvas'});
+    });
+    return;
+  }
+  if (!applyOverlaySelection(overlayId, {source: 'canvas'})) return;
   event.preventDefault();
   event.stopPropagation();
   const element = event.target.closest('.editor-overlay');
@@ -826,7 +981,7 @@ async function saveOverlayGeometry(overlay, original, element) {
   } catch (error) {
     Object.assign(overlay, original);
     if (element.isConnected) applyOverlayGeometry(element, overlay);
-    alert(error.message);
+    void showMessage(error.message);
   } finally {
     savingOverlayIds.delete(overlay.id);
     if (overlay.page_id === currentPageId) {
@@ -881,12 +1036,12 @@ function renderOverlayElements() {
       const deleteButton = row.querySelector('.delete-overlay');
       row.addEventListener('pointerenter', () => setHoveredOverlay(row.dataset.id));
       row.addEventListener('pointerleave', () => setHoveredOverlay(null));
-      selectButton.addEventListener('click', () => selectOverlay(row.dataset.id, {source: 'list'}));
+      selectButton.addEventListener('click', () => void selectOverlay(row.dataset.id, {source: 'list'}));
       selectButton.addEventListener('focus', () => setHoveredOverlay(row.dataset.id));
       selectButton.addEventListener('blur', () => setHoveredOverlay(null));
       deleteButton.addEventListener('focus', () => setHoveredOverlay(row.dataset.id));
       deleteButton.addEventListener('blur', () => setHoveredOverlay(null));
-      deleteButton.addEventListener('click', () => deleteOverlay(row.dataset.id));
+      deleteButton.addEventListener('click', () => void deleteOverlay(row.dataset.id));
     });
   }
 
@@ -922,7 +1077,7 @@ function renderOverlayElements() {
   document.getElementById('overlayVideoControls')?.addEventListener('change', (event) => {
     void updateOverlayProperties(selected.id, {video_controls: event.target.checked});
   });
-  document.getElementById('deleteSelectedOverlay').addEventListener('click', () => deleteOverlay(selected.id));
+  document.getElementById('deleteSelectedOverlay').addEventListener('click', () => void deleteOverlay(selected.id));
 }
 
 async function updateOverlayProperties(overlayId, updates) {
@@ -938,7 +1093,7 @@ async function updateOverlayProperties(overlayId, updates) {
     const index = state.overlays.findIndex((item) => item.id === saved.id);
     if (index >= 0) state.overlays[index] = saved;
   } catch (error) {
-    alert(error.message);
+    void showMessage(error.message);
   } finally {
     savingOverlayIds.delete(overlayId);
     if (overlay.page_id === currentPageId) {
@@ -955,7 +1110,7 @@ async function deleteOverlay(overlayId) {
   const deleteMessage = overlay.storage_backend === 'url'
     ? `删除${name}？只会移除页面中的链接配置，原始媒体不会受影响。`
     : `删除${name}？底层媒体资源也会同步删除。`;
-  if (!window.confirm(deleteMessage)) return;
+  if (!await showConfirm(deleteMessage, {title: '确认删除', confirmText: '删除', danger: true})) return;
   savingOverlayIds.add(overlayId);
   try {
     await api(`/api/overlays/${overlayId}`, {method: 'DELETE'});
@@ -965,7 +1120,7 @@ async function deleteOverlay(overlayId) {
     renderOverlayElements();
     rerenderEditorOverlays();
   } catch (error) {
-    alert(error.message);
+    void showMessage(error.message);
   } finally {
     savingOverlayIds.delete(overlayId);
   }
@@ -1005,7 +1160,7 @@ async function uploadOverlay(input) {
   input.value = '';
   const page = currentPage();
   if (!file || !page || overlayUploadInProgress) return;
-  if (!confirmDiscardSelection()) return;
+  if (!await confirmDiscardSelection()) return;
   selection = null;
   selectedOverlayId = null;
   hoveredOverlayId = null;
@@ -1025,7 +1180,7 @@ async function uploadOverlay(input) {
     renderOverlayElements();
     rerenderEditorOverlays();
   } catch (error) {
-    alert(error.message);
+    void showMessage(error.message);
   } finally {
     setOverlayUploadInProgress(false);
   }
@@ -1137,8 +1292,9 @@ function selectCreatedOverlay(saved) {
   rerenderEditorOverlays();
 }
 
-overlayLinkButton.addEventListener('click', () => {
-  if (!currentPage() || overlayUploadInProgress || !confirmDiscardSelection()) return;
+overlayLinkButton.addEventListener('click', async () => {
+  if (!currentPage() || overlayUploadInProgress) return;
+  if (!await confirmDiscardSelection()) return;
   overlayLinkForm.reset();
   setOverlayLinkStatus();
   overlayLinkDialog.showModal();
@@ -1225,16 +1381,16 @@ function renderRenderSettings() {
 async function saveRenderSettings() {
   const page = currentPage();
   if (!page || page.type !== 'html') return;
-  if (!confirmDiscardSelection()) return;
+  if (!await confirmDiscardSelection()) return;
   const renderMode = document.getElementById('pageRenderMode').value;
   const viewportWidth = Number(document.getElementById('pageViewportWidth').value);
   const viewportHeight = Number(document.getElementById('pageViewportHeight').value);
   if (!Number.isInteger(viewportWidth) || viewportWidth < 240 || viewportWidth > 10000) {
-    alert('设计宽度需在 240–10000 之间');
+    void showMessage('设计宽度需在 240–10000 之间');
     return;
   }
   if (!Number.isInteger(viewportHeight) || viewportHeight < 240 || viewportHeight > 10000) {
-    alert('设计高度需在 240–10000 之间');
+    void showMessage('设计高度需在 240–10000 之间');
     return;
   }
   try {
@@ -1245,7 +1401,7 @@ async function saveRenderSettings() {
     });
     await reload(true);
   } catch (error) {
-    alert(error.message);
+    void showMessage(error.message);
   }
 }
 
@@ -1280,7 +1436,7 @@ function renderImageHotspots() {
     const label = document.createElement('span');
     label.textContent = displayName;
     hotspot.appendChild(label);
-    hotspot.addEventListener('click', () => selectInteraction(interaction.id, {source: 'canvas'}));
+    hotspot.addEventListener('click', () => void selectInteraction(interaction.id, {source: 'canvas'}));
     hotspot.addEventListener('pointerenter', () => setHoveredInteraction(interaction.id));
     hotspot.addEventListener('pointerleave', () => setHoveredInteraction(null));
     hotspot.addEventListener('focus', () => setHoveredInteraction(interaction.id));
@@ -1320,7 +1476,13 @@ function applyImageHotspotState() {
 
 function startDraw(event) {
   if (event.button !== 0 || event.target.closest('.hotspot')) return;
-  if (!confirmDiscardSelection()) return;
+  if (hasUnsavedSelection()) {
+    event.preventDefault();
+    void confirmDiscardSelection().then((confirmed) => {
+      if (confirmed) clearSelection();
+    });
+    return;
+  }
   selectedOverlayId = null;
   hoveredOverlayId = null;
   renderOverlayElements();
@@ -1457,14 +1619,14 @@ function scrollImageHotspotIntoView(interactionId) {
   });
 }
 
-function selectInteraction(interactionId, {label = '', source = 'list'} = {}) {
+async function selectInteraction(interactionId, {label = '', source = 'list'} = {}) {
   const interaction = interactionById(interactionId);
   if (!interaction || interaction.source_page_id !== currentPageId) return;
   if (selection?.interactionId === interactionId) {
     if (source === 'list' && interaction.kind === 'element') postHtmlEditorState(interactionId);
     return;
   }
-  if (!confirmDiscardSelection()) return;
+  if (!await confirmDiscardSelection()) return;
   selectedOverlayId = null;
   hoveredOverlayId = null;
   selection = selectionForInteraction(interaction, label);
@@ -1481,8 +1643,8 @@ function selectInteraction(interactionId, {label = '', source = 'list'} = {}) {
   if (source === 'canvas') scrollInteractionCardIntoView(interactionId);
 }
 
-function createElementSelection(data) {
-  if (!confirmDiscardSelection()) return;
+async function createElementSelection(data) {
+  if (!await confirmDiscardSelection()) return;
   selectedOverlayId = null;
   hoveredOverlayId = null;
   selection = {
@@ -1521,8 +1683,8 @@ window.addEventListener('message', (event) => {
     const existing = currentInteractions().find(
       (interaction) => interaction.kind === 'element' && interaction.payload.elementId === data.elementId,
     );
-    if (existing) selectInteraction(existing.id, {label: `<${data.tag}> ${data.text || data.elementId}`, source: 'canvas'});
-    else createElementSelection(data);
+    if (existing) void selectInteraction(existing.id, {label: `<${data.tag}> ${data.text || data.elementId}`, source: 'canvas'});
+    else void createElementSelection(data);
     return;
   }
   if (data.type === 'uipm-element-hover') {
@@ -1655,11 +1817,11 @@ function clearSelection() {
 async function saveInteraction() {
   const name = selection.name.trim().replace(/\s+/g, ' ');
   if (!name) {
-    alert('请输入交互名称');
+    void showMessage('请输入交互名称');
     return;
   }
   if (selection.action === 'navigate' && !selection.targetId) {
-    alert('请选择目标页面');
+    void showMessage('请选择目标页面');
     return;
   }
   if (selection.action === 'external') {
@@ -1669,7 +1831,7 @@ async function saveInteraction() {
         throw new Error('invalid URL');
       }
     } catch (_error) {
-      alert('请输入有效的 HTTP(S) 外部网页链接');
+      void showMessage('请输入有效的 HTTP(S) 外部网页链接');
       return;
     }
   }
@@ -1709,7 +1871,7 @@ async function saveInteraction() {
     renderInteractions();
     refreshCanvasAnnotations({rerenderImage: saved.kind === 'region'});
   } catch (error) {
-    alert(error.message);
+    void showMessage(error.message);
     button.disabled = false;
   }
 }
@@ -1746,18 +1908,23 @@ function renderInteractions() {
     card.addEventListener('pointerleave', () => setHoveredInteraction(null));
   });
   interactionList.querySelectorAll('.interaction-select').forEach((button) => {
-    button.addEventListener('click', () => selectInteraction(button.dataset.id, {source: 'list'}));
+    button.addEventListener('click', () => void selectInteraction(button.dataset.id, {source: 'list'}));
     button.addEventListener('focus', () => setHoveredInteraction(button.dataset.id));
     button.addEventListener('blur', () => setHoveredInteraction(null));
   });
   interactionList.querySelectorAll('.delete-interaction').forEach((button) => {
-    button.addEventListener('click', () => deleteInteraction(button.dataset.id));
+    button.addEventListener('click', () => void deleteInteraction(button.dataset.id));
   });
 }
 
 async function deleteInteraction(interactionId) {
   const interaction = interactionById(interactionId);
-  if (!interaction || !window.confirm(`删除交互“${interaction.name}”？`)) return;
+  if (!interaction) return;
+  if (!await showConfirm(`删除交互“${interaction.name}”？`, {
+    title: '确认删除',
+    confirmText: '删除',
+    danger: true,
+  })) return;
   try {
     await api(`/api/interactions/${interactionId}`, {method: 'DELETE'});
     state.interactions = state.interactions.filter((item) => item.id !== interactionId);
@@ -1769,15 +1936,15 @@ async function deleteInteraction(interactionId) {
     renderInteractions();
     refreshCanvasAnnotations({rerenderImage: interaction.kind === 'region'});
   } catch (error) {
-    alert(error.message);
+    void showMessage(error.message);
   }
 }
 
-function prepareUpload(files) {
+async function prepareUpload(files) {
   pendingFiles = Array.from(files || []);
   document.getElementById('fileInput').value = '';
   if (!pendingFiles.length) return;
-  if (!confirmDiscardSelection()) {
+  if (!await confirmDiscardSelection()) {
     pendingFiles = [];
     return;
   }
@@ -1815,11 +1982,11 @@ replaceImageInput.addEventListener('change', async () => {
     if (page.id === currentPageId) renderCanvas();
     renderPageList();
   } catch (error) {
-    alert(error.message);
+    void showMessage(error.message);
   }
 });
 
-document.getElementById('fileInput').addEventListener('change', (event) => prepareUpload(event.target.files));
+document.getElementById('fileInput').addEventListener('change', (event) => void prepareUpload(event.target.files));
 uploadCancel.addEventListener('click', () => {
   if (uploadInProgress) return;
   pendingFiles = [];
@@ -1838,20 +2005,20 @@ uploadForm.addEventListener('submit', async (event) => {
   if (uploadInProgress) return;
   const inputs = Array.from(uploadRows.querySelectorAll('.upload-name-input'));
   const names = inputs.map((input) => input.value.trim().replace(/\s+/g, ' '));
-  if (names.some((name) => !name)) return alert('页面名称不能为空');
+  if (names.some((name) => !name)) return showMessage('页面名称不能为空');
   const folded = names.map(norm);
-  if (new Set(folded).size !== folded.length) return alert('本次上传的页面名称存在重复');
+  if (new Set(folded).size !== folded.length) return showMessage('本次上传的页面名称存在重复');
   const existing = new Set(state.pages.map((page) => norm(page.name)));
   const collision = names.find((name) => existing.has(norm(name)));
-  if (collision) return alert(`页面名称“${collision}”在当前项目中已存在`);
+  if (collision) return showMessage(`页面名称“${collision}”在当前项目中已存在`);
 
   const viewportWidth = Number(uploadViewportWidth.value);
   const viewportHeight = Number(uploadViewportHeight.value);
   if (!Number.isInteger(viewportWidth) || viewportWidth < 240 || viewportWidth > 10000) {
-    return alert('设计宽度需在 240–10000 之间');
+    return showMessage('设计宽度需在 240–10000 之间');
   }
   if (!Number.isInteger(viewportHeight) || viewportHeight < 240 || viewportHeight > 10000) {
-    return alert('设计高度需在 240–10000 之间');
+    return showMessage('设计高度需在 240–10000 之间');
   }
 
   const formData = new FormData();
@@ -1873,7 +2040,7 @@ uploadForm.addEventListener('submit', async (event) => {
     setUploadInProgress(false);
   } catch (error) {
     setUploadInProgress(false);
-    alert(error.message);
+    void showMessage(error.message);
   }
 });
 
@@ -1901,7 +2068,7 @@ renameForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (!renameTarget) return;
   const name = renameInput.value.trim().replace(/\s+/g, ' ');
-  if (!name) return alert('请输入名称');
+  if (!name) return showMessage('请输入名称');
   const url = renameTarget.kind === 'page'
     ? `/api/pages/${renameTarget.id}`
     : `/api/interactions/${renameTarget.id}`;
@@ -1915,32 +2082,21 @@ renameForm.addEventListener('submit', async (event) => {
     renameTarget = null;
     await reload(true);
   } catch (error) {
-    alert(error.message);
+    void showMessage(error.message);
   }
 });
 
-function askDeletePage(pageId) {
+async function askDeletePage(pageId) {
   const page = state.pages.find((item) => item.id === pageId);
   if (!page) return;
-  document.getElementById('confirmText').textContent =
-    `删除“${page.name}”？所有指向该页面、以及从该页面发出的跳转都会自动清理，底层资源也会从 ${storageLabel(page)} 删除。`;
-  confirmDialog.showModal();
-  const ok = document.getElementById('confirmOk');
-  const cancel = document.getElementById('confirmCancel');
-  const cleanup = () => {
-    ok.onclick = null;
-    cancel.onclick = null;
-  };
-  cancel.onclick = () => {
-    cleanup();
-    confirmDialog.close();
-  };
-  ok.onclick = async () => {
-    cleanup();
-    confirmDialog.close();
+  const message = `删除“${page.name}”？所有指向该页面、以及从该页面发出的跳转都会自动清理，底层资源也会从 ${storageLabel(page)} 删除。`;
+  if (!await showConfirm(message, {title: '确认删除', confirmText: '删除', danger: true})) return;
+  try {
     await api(`/api/pages/${pageId}`, {method: 'DELETE'});
     await reload(false);
-  };
+  } catch (error) {
+    void showMessage(error.message);
+  }
 }
 
 document.addEventListener('keydown', (event) => {
