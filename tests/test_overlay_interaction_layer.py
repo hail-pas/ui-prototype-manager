@@ -37,7 +37,7 @@ def test_player_video_overlay_no_longer_covers_region_hotspots() -> None:
 
 
 def test_overlay_interaction_assets_are_loaded() -> None:
-    stylesheet = "/static/overlay-interactions.css?v=20260906-overlay-interactions"
+    stylesheet = "/static/overlay-interactions.css?v=20260906-overlay-interactions-v3"
     html_layer_script = "/static/html-interaction-layer.js?v=20260906-overlay-interactions-v2"
     assert stylesheet in EDITOR_TEMPLATE
     assert stylesheet in PLAYER_TEMPLATE
