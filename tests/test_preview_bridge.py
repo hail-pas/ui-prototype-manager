@@ -95,7 +95,7 @@ class PreviewBridgeTests(unittest.TestCase):
             )
         )
 
-    def test_player_bridge_extension_validates_frame_project_and_page(self) -> None:
+    def test_player_bridge_extension_waits_for_outgoing_view_to_leave_visual_stack(self) -> None:
         script = (ROOT / "app/static/preview-bridge-player.js").read_text(
             encoding="utf-8"
         )
@@ -107,18 +107,20 @@ class PreviewBridgeTests(unittest.TestCase):
         self.assertIn("!page(targetPageId)", script)
         self.assertIn("!externalOpen", script)
         self.assertIn("targetPageId === currentPageId", script)
+        self.assertIn("const sourcePageId = currentPageId", script)
         self.assertIn("await navigation.navigate(targetPageId)", script)
-        self.assertIn("if (committed && externalOpen) closeExternalPage();", script)
-        self.assertNotIn(
-            "if (typeof closeExternalPage !== 'function' || !closeExternalPage()) return;",
-            script,
-        )
+        self.assertIn("waitForOutgoingPageToSettle", script)
+        self.assertIn("view.classList.contains('is-cached')", script)
+        self.assertIn("new MutationObserver", script)
+        self.assertIn("await waitForOutgoingPageToSettle(sourcePageId)", script)
+        self.assertIn("if (externalOpen) closeExternalPage();", script)
+
         navigate_index = script.index("await navigation.navigate(targetPageId)")
-        close_after_commit_index = script.index(
-            "if (committed && externalOpen) closeExternalPage();"
-        )
-        self.assertLess(navigate_index, close_after_commit_index)
-        self.assertIn("/static/preview-bridge-player.js", template)
+        settle_index = script.index("await waitForOutgoingPageToSettle(sourcePageId)")
+        close_index = script.index("if (externalOpen) closeExternalPage();")
+        self.assertLess(navigate_index, settle_index)
+        self.assertLess(settle_index, close_index)
+        self.assertIn("preview-bridge-player.js?v=20260907-preview-bridge-v3", template)
         self.assertIn("preview_bridge as _preview_bridge", package_init)
 
 
