@@ -7,11 +7,13 @@ import json
 from typing import Any
 
 from fastapi import HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import Response
 
 from app.page_management import router
 
 BRIDGE_VERSION = "v1"
+BRIDGE_COMMAND_COOKIE = "uipm_preview_bridge"
+BRIDGE_COMMAND_MAX_AGE = 30
 
 
 def _core() -> Any:
@@ -39,7 +41,7 @@ def valid_bridge_token(project_id: str, page_id: str, token: str) -> bool:
         return False
 
 
-def _bridge_payload(project_id: str, page_id: str) -> str:
+def _bridge_command(project_id: str, page_id: str) -> str:
     payload = json.dumps(
         {
             "type": "uipm-external-navigate",
@@ -48,9 +50,8 @@ def _bridge_payload(project_id: str, page_id: str) -> str:
         },
         ensure_ascii=True,
         separators=(",", ":"),
-    )
-    # Keep JSON safe inside an inline <script> even if identifier formats change later.
-    return payload.replace("<", "\\u003c")
+    ).encode("utf-8")
+    return _b64encode(payload)
 
 
 @router.get("/api/pages/{page_id}/bridge-url", name="api_page_bridge_url")
@@ -74,10 +75,10 @@ def api_page_bridge_url(request: Request, page_id: str):
 
 @router.get(
     "/content/preview-bridge/{project_id}/{page_id}/{token}",
-    response_class=HTMLResponse,
+    response_class=Response,
     name="preview_bridge",
 )
-def preview_bridge(project_id: str, page_id: str, token: str):
+def preview_bridge(request: Request, project_id: str, page_id: str, token: str):
     # /content/* is intentionally public today. The stable HMAC limits a bridge URL
     # to one project/page pair without granting any authenticated application access.
     if not valid_bridge_token(project_id, page_id, token):
@@ -88,35 +89,20 @@ def preview_bridge(project_id: str, page_id: str, token: str):
     if str(page["project_id"]) != project_id:
         raise HTTPException(404, "Bridge URL is invalid")
 
-    payload = _bridge_payload(project_id, page_id)
-    html = f"""<!doctype html>
-<html lang=\"zh-CN\">
-<head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-  <title>返回预览</title>
-</head>
-<body>
-  <p id=\"status\">正在返回预览…</p>
-  <script>
-    (() => {{
-      const payload = {payload};
-      if (window.parent !== window) {{
-        window.parent.postMessage(payload, '*');
-        return;
-      }}
-      document.getElementById('status').textContent = 'Bridge URL 仅用于预览中的外部页面跳转。';
-    }})();
-  </script>
-</body>
-</html>
-"""
-    return HTMLResponse(
-        html,
-        headers={
-            "Cache-Control": "no-store",
-            "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'none'; base-uri 'none'; form-action 'none'",
-            "Referrer-Policy": "no-referrer",
-            "X-Content-Type-Options": "nosniff",
-        },
+    # A 204 navigation keeps the iframe's current active document in place. The
+    # short-lived same-origin cookie is only a handoff signal to the parent Player;
+    # it does not grant authentication or persist the target beyond this transition.
+    response = Response(status_code=204)
+    response.set_cookie(
+        BRIDGE_COMMAND_COOKIE,
+        _bridge_command(project_id, page_id),
+        max_age=BRIDGE_COMMAND_MAX_AGE,
+        path="/",
+        secure=request.url.scheme == "https",
+        httponly=False,
+        samesite="lax",
     )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
