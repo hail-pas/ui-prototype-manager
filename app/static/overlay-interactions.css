@@ -106,3 +106,47 @@
 .player-hotspot {
   z-index: 20;
 }
+
+.overlay-z-order-controls {
+  display: grid;
+  gap: 8px;
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border, #e5e7eb);
+}
+
+.overlay-z-order-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text, #111827);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.overlay-z-order-position {
+  color: var(--muted, #6b7280);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}
+
+.overlay-z-order-actions {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.overlay-z-order-btn {
+  min-width: 0;
+  padding-inline: 6px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.overlay-z-order-note {
+  margin: 0;
+  color: var(--muted, #6b7280);
+  font-size: 11px;
+  line-height: 1.45;
+}
