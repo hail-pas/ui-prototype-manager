@@ -105,8 +105,19 @@ class PreviewBridgeTests(unittest.TestCase):
         self.assertIn("event.source !== bridgeExternalFrame.contentWindow", script)
         self.assertIn("targetProjectId !== bridgeRoot.dataset.projectId", script)
         self.assertIn("!page(targetPageId)", script)
-        self.assertIn("closeExternalPage()", script)
-        self.assertIn("navigate(targetPageId)", script)
+        self.assertIn("!externalOpen", script)
+        self.assertIn("targetPageId === currentPageId", script)
+        self.assertIn("await navigation.navigate(targetPageId)", script)
+        self.assertIn("if (committed && externalOpen) closeExternalPage();", script)
+        self.assertNotIn(
+            "if (typeof closeExternalPage !== 'function' || !closeExternalPage()) return;",
+            script,
+        )
+        navigate_index = script.index("await navigation.navigate(targetPageId)")
+        close_after_commit_index = script.index(
+            "if (committed && externalOpen) closeExternalPage();"
+        )
+        self.assertLess(navigate_index, close_after_commit_index)
         self.assertIn("/static/preview-bridge-player.js", template)
         self.assertIn("preview_bridge as _preview_bridge", package_init)
 
