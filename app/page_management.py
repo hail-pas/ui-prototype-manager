@@ -21,6 +21,10 @@ class ProjectUpdate(BaseModel):
     name: str
 
 
+class ProjectDuplicateRequest(BaseModel):
+    name: str | None = None
+
+
 class PageDuplicateRequest(BaseModel):
     name: str | None = None
 
@@ -187,6 +191,300 @@ def api_update_project(project_id: str, payload: ProjectUpdate):
     with core.db() as conn:
         conn.execute("UPDATE projects SET name = ? WHERE id = ?", (name, project_id))
     return core.get_project(project_id)
+
+
+@router.post("/api/projects/{project_id}/duplicate")
+def api_duplicate_project(project_id: str, payload: ProjectDuplicateRequest):
+    core = _core()
+    project = core.get_project(project_id)
+    requested_name = payload.name if payload.name is not None else f'{project["name"]} copy'
+    new_name = core.clean_name(requested_name, kind="Project")
+    new_project_id = str(uuid.uuid4())
+
+    with core.db() as conn:
+        pages = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM pages WHERE project_id = ? ORDER BY sort_order, created_at",
+                (project_id,),
+            ).fetchall()
+        ]
+        assets_by_page = {
+            str(page["id"]): [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT relative_path, media_type, size_bytes
+                    FROM page_assets
+                    WHERE page_id = ?
+                    ORDER BY relative_path
+                    """,
+                    (page["id"],),
+                ).fetchall()
+            ]
+            for page in pages
+        }
+        interactions = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM interactions WHERE project_id = ? ORDER BY created_at, id",
+                (project_id,),
+            ).fetchall()
+        ]
+        overlays = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT * FROM overlays
+                WHERE project_id = ?
+                ORDER BY page_id, z_index, created_at, id
+                """,
+                (project_id,),
+            ).fetchall()
+        ]
+
+    page_id_map = {str(page["id"]): str(uuid.uuid4()) for page in pages}
+    if any(str(item["source_page_id"]) not in page_id_map for item in interactions):
+        raise HTTPException(409, "项目存在异常页面关联，无法安全复制")
+    if any(
+        item["target_page_id"] is not None
+        and str(item["target_page_id"]) not in page_id_map
+        for item in interactions
+    ):
+        raise HTTPException(409, "项目存在跨项目页面跳转，无法安全复制")
+    if any(str(item["page_id"]) not in page_id_map for item in overlays):
+        raise HTTPException(409, "项目存在异常页面元素关联，无法安全复制")
+
+    copied_objects: list[tuple[str, str]] = []
+    copied_pages: list[dict[str, Any]] = []
+    copied_overlays: list[dict[str, Any]] = []
+
+    try:
+        for page in pages:
+            old_page_id = str(page["id"])
+            new_page_id = page_id_map[old_page_id]
+            backend = str(page["storage_backend"])
+            new_prefix = core.page_storage_prefix(
+                new_project_id, new_page_id, backend
+            )
+            copied_assets = assets_by_page[old_page_id]
+            for asset in copied_assets:
+                relative_path = str(asset["relative_path"])
+                source_key = core.asset_storage_key(page, relative_path)
+                target_key = f'{new_prefix.rstrip("/")}/{relative_path}'
+                _copy_storage_object(
+                    core,
+                    backend=backend,
+                    source_key=source_key,
+                    target_key=target_key,
+                    media_type=str(asset["media_type"]),
+                    size_bytes=int(asset["size_bytes"]),
+                )
+                copied_objects.append((backend, target_key))
+
+            instrumentation_version = int(page.get("instrumentation_version") or 0)
+            if str(page["type"]) == "html":
+                copied_page = {
+                    **page,
+                    "id": new_page_id,
+                    "project_id": new_project_id,
+                    "storage_prefix": new_prefix,
+                }
+                prepared = core.prepare_html_asset(
+                    new_page_id,
+                    core.read_page_asset(copied_page, str(page["entry_path"])),
+                )
+                core.store_asset_bytes(
+                    backend=backend,
+                    key=core.asset_storage_key(copied_page, str(page["entry_path"])),
+                    data=prepared,
+                    media_type="text/html; charset=utf-8",
+                )
+                for asset in copied_assets:
+                    if str(asset["relative_path"]) == str(page["entry_path"]):
+                        asset["size_bytes"] = len(prepared)
+                        asset["media_type"] = "text/html; charset=utf-8"
+                        break
+                instrumentation_version = core.HTML_INSTRUMENTATION_VERSION
+
+            copied_pages.append(
+                {
+                    **page,
+                    "id": new_page_id,
+                    "project_id": new_project_id,
+                    "storage_prefix": new_prefix,
+                    "instrumentation_version": instrumentation_version,
+                    "_source_id": old_page_id,
+                }
+            )
+
+        for overlay in overlays:
+            new_overlay_id = str(uuid.uuid4())
+            overlay_backend = str(overlay["storage_backend"])
+            target_key = str(overlay["storage_key"])
+            if overlay_backend != "url":
+                suffix = os.path.splitext(str(overlay["storage_key"]))[1]
+                target_key = core.overlay_storage_key(
+                    new_project_id, new_overlay_id, suffix, overlay_backend
+                )
+                _copy_storage_object(
+                    core,
+                    backend=overlay_backend,
+                    source_key=str(overlay["storage_key"]),
+                    target_key=target_key,
+                    media_type=str(overlay["media_type"]),
+                    size_bytes=int(overlay["size_bytes"]),
+                )
+                copied_objects.append((overlay_backend, target_key))
+            copied_overlays.append(
+                {
+                    **overlay,
+                    "id": new_overlay_id,
+                    "project_id": new_project_id,
+                    "page_id": page_id_map[str(overlay["page_id"])],
+                    "storage_key": target_key,
+                }
+            )
+
+        with core.db() as conn:
+            conn.execute(
+                "INSERT INTO projects(id, name, created_at) VALUES (?, ?, ?)",
+                (new_project_id, new_name, core.now_iso()),
+            )
+
+            for page in copied_pages:
+                conn.execute(
+                    """
+                    INSERT INTO pages(
+                        id, project_id, name, type, storage_backend, storage_prefix,
+                        entry_path, render_mode, viewport_width, viewport_height,
+                        instrumentation_version, sort_order, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        page["id"],
+                        new_project_id,
+                        page["name"],
+                        page["type"],
+                        page["storage_backend"],
+                        page["storage_prefix"],
+                        page["entry_path"],
+                        page.get("render_mode", core.DEFAULT_RENDER_MODE),
+                        int(page.get("viewport_width") or core.DEFAULT_VIEWPORT_WIDTH),
+                        int(page.get("viewport_height") or core.DEFAULT_VIEWPORT_HEIGHT),
+                        int(page.get("instrumentation_version") or 0),
+                        int(page.get("sort_order") or 0),
+                        page["created_at"],
+                    ),
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO page_assets(page_id, relative_path, media_type, size_bytes)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            page["id"],
+                            asset["relative_path"],
+                            asset["media_type"],
+                            asset["size_bytes"],
+                        )
+                        for asset in assets_by_page[page["_source_id"]]
+                    ],
+                )
+
+            for interaction in interactions:
+                target_page_id = interaction["target_page_id"]
+                if target_page_id is not None:
+                    target_page_id = page_id_map[str(target_page_id)]
+                conn.execute(
+                    """
+                    INSERT INTO interactions(
+                        id, project_id, name, source_page_id, action,
+                        target_page_id, target_url, kind, payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        new_project_id,
+                        interaction["name"],
+                        page_id_map[str(interaction["source_page_id"])],
+                        interaction["action"],
+                        target_page_id,
+                        interaction["target_url"],
+                        interaction["kind"],
+                        interaction["payload_json"],
+                        interaction["created_at"],
+                    ),
+                )
+
+            for overlay in copied_overlays:
+                conn.execute(
+                    """
+                    INSERT INTO overlays(
+                        id, project_id, page_id, type, storage_backend, storage_key,
+                        media_type, size_bytes, x, y, width, height, aspect_ratio,
+                        object_fit, z_index, video_controls, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        overlay["id"],
+                        new_project_id,
+                        overlay["page_id"],
+                        overlay["type"],
+                        overlay["storage_backend"],
+                        overlay["storage_key"],
+                        overlay["media_type"],
+                        overlay["size_bytes"],
+                        overlay["x"],
+                        overlay["y"],
+                        overlay["width"],
+                        overlay["height"],
+                        overlay["aspect_ratio"],
+                        overlay["object_fit"],
+                        overlay["z_index"],
+                        overlay["video_controls"],
+                        overlay["created_at"],
+                        overlay["updated_at"],
+                    ),
+                )
+    except sqlite3.IntegrityError as exc:
+        _cleanup_storage(core, copied_objects)
+        try:
+            shutil.rmtree(
+                core.local_asset_path(f"assets/{new_project_id}"), ignore_errors=True
+            )
+        except (OSError, RuntimeError):
+            pass
+        raise HTTPException(409, "复制项目时发生名称或数据冲突") from exc
+    except HTTPException:
+        _cleanup_storage(core, copied_objects)
+        try:
+            shutil.rmtree(
+                core.local_asset_path(f"assets/{new_project_id}"), ignore_errors=True
+            )
+        except (OSError, RuntimeError):
+            pass
+        raise
+    except Exception as exc:
+        _cleanup_storage(core, copied_objects)
+        try:
+            shutil.rmtree(
+                core.local_asset_path(f"assets/{new_project_id}"), ignore_errors=True
+            )
+        except (OSError, RuntimeError):
+            pass
+        raise HTTPException(502, "复制项目资源失败") from exc
+
+    return {
+        "project": core.get_project(new_project_id),
+        "copied": {
+            "pages": len(pages),
+            "assets": sum(len(items) for items in assets_by_page.values()),
+            "interactions": len(interactions),
+            "overlays": len(overlays),
+        },
+    }
 
 
 @router.post("/api/projects/{project_id}/video-pages")
