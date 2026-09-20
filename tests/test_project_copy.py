@@ -31,24 +31,51 @@ class ProjectCopyTests(unittest.TestCase):
             )
             for index, page_id in enumerate(("page-a", "page-b")):
                 prefix = f"assets/project-a/{page_id}"
+                is_html = page_id == "page-a"
+                page_type = "html" if is_html else "image"
+                entry_path = "index.html" if is_html else "image.png"
+                instrumentation_version = (
+                    main.HTML_INSTRUMENTATION_VERSION if is_html else 0
+                )
                 connection.execute(
                     """
                     INSERT INTO pages(
                         id, project_id, name, type, storage_backend, storage_prefix,
-                        entry_path, sort_order, created_at
-                    ) VALUES (?, 'project-a', ?, 'image', 'local', ?, 'image.png', ?, ?)
+                        entry_path, instrumentation_version, sort_order, created_at
+                    ) VALUES (?, 'project-a', ?, ?, 'local', ?, ?, ?, ?, ?)
                     """,
-                    (page_id, f"Page {index + 1}", prefix, index, created_at),
+                    (
+                        page_id,
+                        f"Page {index + 1}",
+                        page_type,
+                        prefix,
+                        entry_path,
+                        instrumentation_version,
+                        index,
+                        created_at,
+                    ),
                 )
-                path = main.local_asset_path(f"{prefix}/image.png")
+                path = main.local_asset_path(f"{prefix}/{entry_path}")
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(f"asset-{page_id}".encode())
+                data = (
+                    main.prepare_html_asset(
+                        page_id, b"<html><body><button>Next</button></body></html>"
+                    )
+                    if is_html
+                    else f"asset-{page_id}".encode()
+                )
+                path.write_bytes(data)
                 connection.execute(
                     """
                     INSERT INTO page_assets(page_id, relative_path, media_type, size_bytes)
-                    VALUES (?, 'image.png', 'image/png', ?)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (page_id, path.stat().st_size),
+                    (
+                        page_id,
+                        entry_path,
+                        "text/html; charset=utf-8" if is_html else "image/png",
+                        path.stat().st_size,
+                    ),
                 )
 
             connection.execute(
@@ -122,11 +149,15 @@ class ProjectCopyTests(unittest.TestCase):
         source_page = main.get_page("page-a")
         copied_page = main.get_page(copied_pages["Page 1"]["id"])
         self.assertNotEqual(source_page["storage_prefix"], copied_page["storage_prefix"])
-        source_asset = main.local_asset_path(main.asset_storage_key(source_page, "image.png"))
-        copied_asset = main.local_asset_path(main.asset_storage_key(copied_page, "image.png"))
-        self.assertEqual(source_asset.read_bytes(), copied_asset.read_bytes())
+        source_asset = main.local_asset_path(main.asset_storage_key(source_page, "index.html"))
+        copied_asset = main.local_asset_path(main.asset_storage_key(copied_page, "index.html"))
+        source_html = source_asset.read_text(encoding="utf-8")
+        copied_html = copied_asset.read_text(encoding="utf-8")
+        self.assertIn('"page-a"', source_html)
+        self.assertIn(f'"{copied_page["id"]}"', copied_html)
+        self.assertNotIn('"page-a"', copied_html)
         copied_asset.write_bytes(b"changed-copy")
-        self.assertEqual(source_asset.read_bytes(), b"asset-page-a")
+        self.assertIn('"page-a"', source_asset.read_text(encoding="utf-8"))
 
         copied_overlay = copied["overlays"][0]
         self.assertNotEqual(copied_overlay["id"], "overlay-a")
