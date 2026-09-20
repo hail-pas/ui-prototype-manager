@@ -32,8 +32,11 @@ button,.upload-btn,.primary-btn,.ghost-btn,.danger-btn{min-height:38px;border-ra
 .project-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px}
 .project-card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:20px;box-shadow:var(--shadow);transition:.15s ease;position:relative;min-height:142px}
 .project-card:hover{transform:translateY(-2px);border-color:#cfd4dc}
-.project-card h3{margin:4px 38px 8px 0;font-size:18px}.project-card p{margin:0;color:var(--muted);font-size:13px}
+.project-card h3{margin:4px 70px 8px 0;font-size:18px}.project-card p{margin:0;color:var(--muted);font-size:13px}
+.project-created{margin-top:4px!important}
 .project-card .card-arrow{position:absolute;bottom:18px;right:18px;width:32px;height:32px;border-radius:50%;background:#f2f4f7;display:grid;place-items:center}
+.project-copy{position:absolute;right:44px;top:12px;border:0;background:transparent;color:#475467;cursor:pointer;padding:6px;border-radius:7px}
+.project-copy:hover{background:#f2f4f7}
 .project-delete{position:absolute;right:12px;top:12px}
 .empty-projects{grid-column:1/-1;border:1px dashed #cfd4dc;border-radius:16px;padding:56px;text-align:center;color:var(--muted);background:rgba(255,255,255,.55)}
 
