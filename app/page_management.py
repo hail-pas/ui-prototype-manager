@@ -267,7 +267,8 @@ def api_duplicate_project(project_id: str, payload: ProjectDuplicateRequest):
             new_prefix = core.page_storage_prefix(
                 new_project_id, new_page_id, backend
             )
-            for asset in assets_by_page[old_page_id]:
+            copied_assets = assets_by_page[old_page_id]
+            for asset in copied_assets:
                 relative_path = str(asset["relative_path"])
                 source_key = core.asset_storage_key(page, relative_path)
                 target_key = f'{new_prefix.rstrip("/")}/{relative_path}'
@@ -280,12 +281,39 @@ def api_duplicate_project(project_id: str, payload: ProjectDuplicateRequest):
                     size_bytes=int(asset["size_bytes"]),
                 )
                 copied_objects.append((backend, target_key))
+
+            instrumentation_version = int(page.get("instrumentation_version") or 0)
+            if str(page["type"]) == "html":
+                copied_page = {
+                    **page,
+                    "id": new_page_id,
+                    "project_id": new_project_id,
+                    "storage_prefix": new_prefix,
+                }
+                prepared = core.prepare_html_asset(
+                    new_page_id,
+                    core.read_page_asset(copied_page, str(page["entry_path"])),
+                )
+                core.store_asset_bytes(
+                    backend=backend,
+                    key=core.asset_storage_key(copied_page, str(page["entry_path"])),
+                    data=prepared,
+                    media_type="text/html; charset=utf-8",
+                )
+                for asset in copied_assets:
+                    if str(asset["relative_path"]) == str(page["entry_path"]):
+                        asset["size_bytes"] = len(prepared)
+                        asset["media_type"] = "text/html; charset=utf-8"
+                        break
+                instrumentation_version = core.HTML_INSTRUMENTATION_VERSION
+
             copied_pages.append(
                 {
                     **page,
                     "id": new_page_id,
                     "project_id": new_project_id,
                     "storage_prefix": new_prefix,
+                    "instrumentation_version": instrumentation_version,
                     "_source_id": old_page_id,
                 }
             )
