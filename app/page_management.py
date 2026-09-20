@@ -286,6 +286,7 @@ def api_duplicate_project(project_id: str, payload: ProjectDuplicateRequest):
                     "id": new_page_id,
                     "project_id": new_project_id,
                     "storage_prefix": new_prefix,
+                    "_source_id": old_page_id,
                 }
             )
 
@@ -360,13 +361,7 @@ def api_duplicate_project(project_id: str, payload: ProjectDuplicateRequest):
                             asset["media_type"],
                             asset["size_bytes"],
                         )
-                        for asset in assets_by_page[str(
-                            next(
-                                old_id
-                                for old_id, mapped_id in page_id_map.items()
-                                if mapped_id == page["id"]
-                            )
-                        )]
+                        for asset in assets_by_page[page["_source_id"]]
                     ],
                 )
 
