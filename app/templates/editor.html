@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ project.name }} · UI Prototype Manager</title>
+  <link rel="stylesheet" href="/static/app.css?v=20260831-external-link" />
+  <link rel="stylesheet" href="/static/page-actions.css?v=20260903-page-copy-v3" />
+  <link rel="stylesheet" href="/static/media-pages.css?v=20260906-video-pages" />
+  <link rel="stylesheet" href="/static/overlay-interactions.css?v=20260907-overlay-z-order" />
+</head>
+<body class="editor-body">
+  <div id="app" data-project-id="{{ project.id }}" class="editor-shell">
+    <header class="topbar">
+      <div class="topbar-left">
+        <a class="back-link" href="/">← 项目</a>
+        <div class="project-title-wrap"><strong>{{ project.name }}</strong><span class="save-state">自动保存</span></div>
+      </div>
+      <div class="topbar-actions">
+        <label class="storage-picker" title="选择本次上传的资源存储位置"><span>存储</span><select id="storageSelect"><option value="local">本地</option></select></label>
+        <label class="upload-btn">＋ 上传页面<input id="fileInput" type="file" multiple accept=".html,.htm,.zip,.png,.jpg,.jpeg,.webp,.gif,.mp4,.webm" hidden /></label>
+        <a class="primary-btn" href="/project/{{ project.id }}/play" target="_blank">▶ 预览</a>
+        <a class="ghost-btn" href="/logout">退出登录</a>
+      </div>
+    </header>
+
+    <aside class="sidebar left-sidebar">
+      <div class="panel-heading"><span>页面</span><span id="pageCount" class="count-pill">0</span></div>
+      <div class="page-search">
+        <input id="pageSearchInput" type="search" autocomplete="off" placeholder="按名称搜索页面" aria-label="按名称搜索页面" />
+        <button id="pageSearchClear" type="button" aria-label="清空页面搜索" title="清空" hidden>×</button>
+      </div>
+      <div id="pageList" class="page-list"></div>
+      <div class="sidebar-tip">先选中页面，再上下拖动调整顺序；搜索时暂停排序。HTML、图片与视频共用页面名称空间。</div>
+    </aside>
+
+    <main class="workspace">
+      <div class="workspace-header"><div><strong id="currentPageName">请选择页面</strong><span id="currentPageMeta"></span></div><div id="modeHelp" class="mode-help"></div></div>
+      <div id="canvasArea" class="canvas-area"></div>
+    </main>
+
+    <aside class="sidebar right-sidebar">
+      <section id="overlayElementsSection" class="overlay-elements-section">
+        <div class="panel-heading"><span>页面元素</span><span id="overlayCount" class="count-pill">0</span></div>
+        <div class="overlay-add-actions">
+          <label class="ghost-btn overlay-add-btn">＋ 图片<input id="overlayImageInput" type="file" accept=".png,.jpg,.jpeg,.webp,.gif" hidden /></label>
+          <label class="ghost-btn overlay-add-btn">＋ 视频<input id="overlayVideoInput" type="file" accept=".mp4,.webm" hidden /></label>
+          <button id="overlayLinkButton" class="ghost-btn overlay-add-btn" type="button">＋ 链接</button>
+        </div>
+        <div id="overlayUploadStatus" class="overlay-upload-status" role="status" aria-live="polite" hidden>
+          <span class="upload-spinner" aria-hidden="true"></span>
+          <span class="overlay-upload-copy">
+            <strong id="overlayUploadTitle">正在上传并处理媒体…</strong>
+            <span id="overlayUploadDetail"></span>
+          </span>
+        </div>
+        <div id="overlaySelectionPanel" class="overlay-selection-panel" hidden></div>
+        <div id="overlayList" class="overlay-list"></div>
+      </section>
+      <section id="renderSettingsSection" class="render-settings-section" hidden>
+        <div class="panel-heading">HTML 显示</div>
+        <div id="renderSettingsPanel" class="render-settings-panel"></div>
+      </section>
+      <div class="panel-heading">交互配置</div>
+      <div id="selectionPanel" class="selection-panel muted-panel">选择 HTML 元素或框选图片/视频区域后，在这里命名，并设置页面跳转、外部网页或返回上一页。</div>
+      <div class="panel-heading interactions-heading">当前页交互 <span id="interactionCount" class="count-pill">0</span></div>
+      <div id="interactionList" class="interaction-list"></div>
+    </aside>
+  </div>
+
+  <dialog id="uploadDialog" class="dialog upload-dialog">
+    <form method="dialog" id="uploadForm">
+      <h2 id="uploadDialogTitle">确认上传页面</h2>
+      <p class="dialog-note">支持 HTML、图片、MP4/WebM 视频页面；ZIP 页面包需包含 index.html，可携带使用相对路径的图片、音视频、样式和脚本资源。</p>
+      <div id="uploadRows" class="upload-name-list"></div>
+      <details class="render-config-details">
+        <summary>HTML 显示配置（已有默认值，通常无需修改）</summary>
+        <div class="render-config-body">
+          <label>显示模式
+            <select id="uploadRenderMode">
+              <option value="auto">自动识别固定画布</option>
+              <option value="fixed">固定设计尺寸</option>
+              <option value="responsive">响应式页面</option>
+            </select>
+          </label>
+          <div class="render-config-grid">
+            <label>设计宽度<input id="uploadViewportWidth" type="number" min="240" max="10000" value="1920" /></label>
+            <label>设计高度<input id="uploadViewportHeight" type="number" min="240" max="10000" value="1080" /></label>
+          </div>
+          <p class="dialog-note">自动模式会在页面横向溢出时识别固定画布；宽高作为固定模式和自动识别的安全默认值。</p>
+        </div>
+      </details>
+      <div id="uploadStatus" class="upload-status" role="status" aria-live="polite" hidden>
+        <span class="upload-spinner" aria-hidden="true"></span>
+        <span class="upload-status-copy">
+          <strong id="uploadStatusTitle">正在上传并处理文件…</strong>
+          <span id="uploadStatusDetail">请保持当前页面打开 · 已耗时 0 秒</span>
+        </span>
+      </div>
+      <div class="dialog-actions"><button type="button" id="uploadCancel" class="ghost-btn">取消</button><button type="submit" id="uploadSubmit" class="primary-btn"><span class="upload-submit-spinner" aria-hidden="true"></span><span id="uploadSubmitLabel">上传</span></button></div>
+    </form>
+  </dialog>
+
+  <dialog id="overlayLinkDialog" class="dialog compact-dialog overlay-link-dialog">
+    <form id="overlayLinkForm">
+      <h2>添加媒体链接</h2>
+      <div class="overlay-link-fields">
+        <label>媒体类型
+          <select id="overlayLinkType">
+            <option value="image">图片</option>
+            <option value="video">视频</option>
+          </select>
+        </label>
+        <label>媒体 URL
+          <input id="overlayLinkUrl" type="url" maxlength="2048" autocomplete="off" placeholder="https://example.com/media.png" required />
+        </label>
+      </div>
+      <p class="dialog-note">链接必须是可直接加载的 HTTP(S) 图片或视频。媒体只会从原链接展示，不会上传或复制到存储。</p>
+      <p id="overlayLinkStatus" class="overlay-link-status" role="status" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button type="button" id="overlayLinkCancel" class="ghost-btn">取消</button>
+        <button type="submit" id="overlayLinkSubmit" class="primary-btn">验证并添加</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="confirmDialog" class="dialog compact-dialog">
+    <form method="dialog"><h2>确认删除</h2><p id="confirmText"></p><div class="dialog-actions"><button type="button" id="confirmCancel" class="ghost-btn">取消</button><button type="button" id="confirmOk" class="danger-btn">删除</button></div></form>
+  </dialog>
+
+  <dialog id="renameDialog" class="dialog compact-dialog">
+    <form method="dialog" id="renameForm">
+      <h2 id="renameTitle">重命名</h2>
+      <label>名称<input id="renameInput" maxlength="120" autocomplete="off" /></label>
+      <p class="dialog-note">名称在所属项目的对应命名空间内必须唯一。</p>
+      <div class="dialog-actions"><button type="button" id="renameCancel" class="ghost-btn">取消</button><button type="submit" class="primary-btn">保存</button></div>
+    </form>
+  </dialog>
+
+  <input id="replaceImageInput" type="file" accept=".png,.jpg,.jpeg,.webp,.gif" hidden />
+  <input id="replaceVideoInput" type="file" accept=".mp4,.webm" hidden />
+
+  <script src="/static/frame-fit.js?v=20260827-media-overlay"></script>
+  <script src="/static/page-list.js?v=20260831-page-management"></script>
+  <script src="/static/editor.js?v=20260906-styled-dialogs"></script>
+  <script src="/static/overlay-z-order.js?v=20260907-overlay-z-order"></script>
+  <script src="/static/page-actions.js?v=20260906-styled-dialogs"></script>
+  <script src="/static/editor-media.js?v=20260906-styled-dialogs"></script>
+  <script src="/static/html-interaction-layer.js?v=20260906-overlay-interactions-v2"></script>
+</body>
+</html>

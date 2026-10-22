@@ -1,0 +1,8 @@
+.venv/
+data/app.db
+data/assets/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+examples
